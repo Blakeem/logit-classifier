@@ -1,0 +1,178 @@
+[project]
+name = "logit-classifier"
+dynamic = ["version"]
+description = "Local zero-shot classifier for text and images. Declares options, returns a calibrated probability for each, generates no text. Accepts the TypeSafe System One request format."
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{ name = "Blake" }]
+keywords = [
+    "zero-shot",
+    "classification",
+    "logits",
+    "calibration",
+    "vision-language-model",
+    "comfyui",
+    "local-llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# Core stays at numpy so a ComfyUI pack installs this beside ComfyUI's pinned CUDA
+# build without pip ever being asked to resolve torch.
+dependencies = ["numpy>=2.1.0"]
+
+[project.optional-dependencies]
+# The transformers backend, which loads its own weights.
+hf = [
+    "torch>=2.11.0",
+    "transformers>=4.57.0",
+    "accelerate>=1.0.0",
+    "safetensors>=0.4.5",
+    "huggingface-hub[hf-xet]>=0.34.0",
+    "torchvision>=0.26.0",
+    "pillow>=12.3.0",
+]
+# The HTTP service and the browser page.
+service = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+logit-classifier = "logit_classifier.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Blakeem/logit-classifier"
+"Bug Tracker" = "https://github.com/Blakeem/logit-classifier/issues"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.28.0",
+    "pyarrow>=25.0.1",
+    # Pinned exactly: ruff 0.16.0 changed its default rule set, so only a fixed
+    # version makes the explicit select list below reproducible.
+    "ruff==0.16.8",
+    "mypy>=1.14.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+# 120 to match ComfyUI-ContextAnchoredTileRefine, since this code is meant to run there too.
+line-length = 120
+
+[tool.ruff.lint]
+# Explicit select, never ruff's defaults, which changed from 59 to 413 rules in 0.16.0.
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import ordering
+    "B",    # bugbear: mutable defaults, loop-variable capture
+    "UP",   # py312 idioms
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RET",  # return paths
+    "PTH",  # pathlib over os.path
+    "ARG",  # unused arguments
+    "T20",  # print and pprint left in library code
+    "N",    # pep8 naming
+    "D",    # docstring form
+    "RUF",  # ruff's own, including RUF100 unused-noqa
+]
+ignore = [
+    "E501",  # line length is the formatter's concern, and none is run here
+    # D1 is the "every symbol needs a docstring" family. A docstring here states the
+    # constraint behind the code, so it is written where it is earned and nowhere else.
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
+    "D203",  # conflicts with D211, and D211 is the one ruff recommends
+    "D213",  # conflicts with D212, and D212 is the one ruff recommends
+]
+
+[tool.ruff.lint.isort]
+# tests-AB scripts import ab_env to put src on sys.path, so it has to sort above logit_classifier.
+known-first-party = ["logit_classifier"]
+
+# TC and TID are deliberately absent. TC would scatter TYPE_CHECKING blocks over numpy
+# and the stdlib, which are core dependencies, while the isolation this package actually
+# needs is proven by tests/test_unit.py TestCoreIsolation. TID252 would ban the parent
+# relative imports that backends/hf.py uses and the rest of the package matches.
+
+[tool.ruff.lint.per-file-ignores]
+# Each A/B harness is a console tool. Printing is its interface.
+"tests-AB/*" = ["T201", "D"]
+# An example implementing a protocol must carry its arguments, used or not.
+"examples/*" = ["T201", "D", "ARG"]
+"tests/*" = ["D", "ARG"]
+# A command line tool's interface is what it prints.
+"src/logit_classifier/cli.py" = ["T201"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/logit_classifier"]
+strict = true
+warn_unreachable = true
+# Errors carry the rule that produced them, so a suppression can name one.
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# transformers publishes no complete stubs, and accelerate none at all. torch is
+# listed so the type gate still runs where the hf extra is absent, such as CI.
+module = ["transformers.*", "accelerate.*", "torch.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# transformers annotates from_pretrained and eval loosely, which strict mode reads
+# as untyped calls. torch resolves to Any where the hf extra is absent, which makes
+# @torch.inference_mode() an untyped decorator. Every other strict check still
+# applies to this module.
+module = ["logit_classifier.backends.hf"]
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["model: needs the model weights and a GPU"]
+addopts = "-q"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/logit_classifier/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/logit_classifier"]
+
+[tool.hatch.build.targets.sdist]
+# The A/B harnesses are the evidence behind every number in FINDINGS.md, so the
+# source distribution carries them. The wheel does not.
+include = [
+    "/src",
+    "/tests",
+    "/tests-AB",
+    "/examples",
+    "/README.md",
+    "/FINDINGS.md",
+    "/LICENSE",
+]

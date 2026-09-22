@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%232f6df6%27/%3E%3Crect x=%273%27 y=%274%27 width=%2710%27 height=%272%27 rx=%271%27 fill=%27white%27/%3E%3Crect x=%273%27 y=%277%27 width=%276%27 height=%272%27 rx=%271%27 fill=%27white%27/%3E%3Crect x=%273%27 y=%2710%27 width=%273%27 height=%272%27 rx=%271%27 fill=%27white%27/%3E%3C/svg%3E">
+<title>Logit Classifier</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14161a; --muted: #5d6470;
+  --line: #dfe3e8; --accent: #2f6df6; --accent-soft: #e7eeff;
+  --bar: #2f6df6; --bar-bg: #eceff3; --warn: #b4560a;
+  --radius: 10px; --mono: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101216; --panel: #181b21; --ink: #e8eaed; --muted: #99a1ae;
+    --line: #2a2f38; --accent: #6b9bff; --accent-soft: #1d2740;
+    --bar: #6b9bff; --bar-bg: #232832; --warn: #e0954a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101216; --panel: #181b21; --ink: #e8eaed; --muted: #99a1ae;
+  --line: #2a2f38; --accent: #6b9bff; --accent-soft: #1d2740;
+  --bar: #6b9bff; --bar-bg: #232832; --warn: #e0954a;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+.badge {
+  font: 12px/1 var(--mono); color: var(--muted); background: var(--bar-bg);
+  border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px;
+}
+.spacer { flex: 1; }
+main {
+  display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr);
+  gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto;
+}
+@media (max-width: 900px) { main { grid-template-columns: minmax(0,1fr); } }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px; min-width: 0;
+}
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+     color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+textarea, input, select {
+  width: 100%; font: inherit; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+}
+textarea { resize: vertical; min-height: 110px; }
+textarea.code { font: 13px/1.5 var(--mono); min-height: 260px; }
+button {
+  font: inherit; font-weight: 550; cursor: pointer; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  padding: 7px 13px;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:disabled { opacity: .55; cursor: progress; }
+button.tiny { padding: 3px 8px; font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.qcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.qcard .head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.qcard .head input { flex: 1 1 120px; font: 13px/1.4 var(--mono); }
+.pill {
+  font: 11px/1 var(--mono); text-transform: uppercase; letter-spacing: .05em;
+  padding: 5px 8px; border-radius: 6px; background: var(--accent-soft); color: var(--accent);
+}
+.opt { display: flex; gap: 6px; margin-top: 6px; }
+.opt input:first-child { flex: 0 0 34%; }
+.hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.answer { border: 1px solid var(--line); border-radius: 8px; padding: 11px; margin-bottom: 11px; }
+.answer .top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 9px; }
+.answer .qid { font: 13px/1 var(--mono); color: var(--muted); }
+.answer .verdict { font-size: 17px; font-weight: 650; }
+.bar-row { display: grid; grid-template-columns: minmax(70px, 30%) 1fr 52px; gap: 8px; align-items: center; margin: 4px 0; font-size: 13px; }
+.bar-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .name.win { font-weight: 650; }
+.track { background: var(--bar-bg); border-radius: 4px; height: 9px; overflow: hidden; }
+.fill { display: block; background: var(--bar); height: 100%; border-radius: 4px; min-width: 0; }
+.bar-row .val { font: 12px/1 var(--mono); color: var(--muted); text-align: right; }
+.meta { font: 12px/1.5 var(--mono); color: var(--muted); margin-top: 8px; }
+.err { color: var(--warn); font-size: 13px; white-space: pre-wrap; }
+.tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.tabs button[aria-selected="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.hidden { display: none !important; }
+pre.out { font: 12px/1.5 var(--mono); background: var(--bg); border: 1px solid var(--line);
+          border-radius: 8px; padding: 10px; overflow: auto; max-height: 340px; margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Logit Classifier</h1>
+  <span class="badge" id="modelBadge">connecting</span>
+  <span class="spacer"></span>
+  <button class="tiny" id="themeBtn">Theme</button>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="tabs">
+      <button id="tabForm" aria-selected="true">Builder</button>
+      <button id="tabJson" aria-selected="false">Raw JSON</button>
+      <span class="spacer"></span>
+      <button class="tiny" id="exampleBtn">Load example</button>
+    </div>
+
+    <div id="formView">
+      <h2>Context</h2>
+      <textarea id="context" placeholder="The text to classify."></textarea>
+
+      <h2 style="margin-top:14px">Questions</h2>
+      <div id="questions"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="tiny" data-add="choice">Add choice</button>
+        <button class="tiny" data-add="score">Add score</button>
+        <button class="tiny" data-add="noul">Add yes/no</button>
+      </div>
+    </div>
+
+    <div id="jsonView" class="hidden">
+      <h2>Request body</h2>
+      <textarea id="jsonBody" class="code" spellcheck="false"></textarea>
+      <p class="hint">Accepts a TypeSafe System One request body unchanged.</p>
+    </div>
+
+    <div class="row" style="margin-top:14px">
+      <button class="primary" id="runBtn">Classify</button>
+      <label class="row" style="gap:5px;font-size:13px">
+        <input type="checkbox" id="diagBox" style="width:auto" checked> Diagnostics
+      </label>
+    </div>
+    <div class="err" id="error"></div>
+  </section>
+
+  <section class="panel">
+    <div class="tabs">
+      <button id="tabAnswers" aria-selected="true">Answers</button>
+      <button id="tabRaw" aria-selected="false">Response JSON</button>
+    </div>
+    <div id="answers"><p class="hint">No result yet.</p></div>
+    <pre class="out hidden" id="rawOut"></pre>
+    <div class="meta" id="meta"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let questions = [];
+let seq = 0;
+let lastResponse = null;
+
+const EXAMPLE = {
+  context: "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP.",
+  questions: [
+    { id: "department", type: "choice", instructions: "Which team should handle this",
+      options: [["billing", "Payment or subscription issues"], ["technical", "Bugs or integration problems"], ["sales", "Pricing or account questions"]] },
+    { id: "frustration", type: "score", instructions: "How frustrated the customer appears",
+      levels: ["Calm, just stating facts", "Frustrated but civil", "Very angry, strong language"] },
+    { id: "is_urgent", type: "noul", instructions: "The message conveys urgency or time-sensitivity", yes: "", no: "" }
+  ]
+};
+
+function blank(type) {
+  seq += 1;
+  const base = { id: type + "_" + seq, type, instructions: "" };
+  if (type === "choice") base.options = [["", ""], ["", ""]];
+  if (type === "score") base.levels = ["", ""];
+  if (type === "noul") { base.yes = ""; base.no = ""; }
+  return base;
+}
+
+function renderQuestions() {
+  const host = $("questions");
+  host.innerHTML = "";
+  questions.forEach((q, qi) => {
+    const card = document.createElement("div");
+    card.className = "qcard";
+    const label = q.type === "noul" ? "yes/no" : q.type;
+    card.innerHTML = `
+      <div class="head">
+        <span class="pill">${label}</span>
+        <input value="${esc(q.id)}" data-f="id" placeholder="question id">
+        <button class="tiny" data-del="${qi}">Remove</button>
+      </div>
+      <input value="${esc(q.instructions)}" data-f="instructions"
+             placeholder="${q.type === "noul" ? "Statement to judge true or false" : "What to decide"}">
+      <div class="body"></div>`;
+    const body = card.querySelector(".body");
+
+    if (q.type === "choice") {
+      q.options.forEach((opt, oi) => body.appendChild(optionRow(qi, oi, opt[0], opt[1], "option", "description (optional)")));
+      body.appendChild(addButton(qi, "option", "Add option"));
+      body.appendChild(hint(`${q.options.length} options. Above 52 the service splits them into groups automatically.`));
+    } else if (q.type === "score") {
+      q.levels.forEach((lv, li) => body.appendChild(levelRow(qi, li, lv)));
+      body.appendChild(addButton(qi, "level", "Add level"));
+      body.appendChild(hint("Ordered low to high. Two to ten levels."));
+    } else {
+      body.appendChild(optionRow(qi, 0, "yes", q.yes, null, "what a yes means (optional)"));
+      body.appendChild(optionRow(qi, 1, "no", q.no, null, "what a no means (optional)"));
+    }
+
+    card.querySelectorAll("[data-f]").forEach(el => {
+      el.oninput = () => { questions[qi][el.dataset.f] = el.value; };
+    });
+    card.querySelector("[data-del]").onclick = () => { questions.splice(qi, 1); renderQuestions(); };
+    host.appendChild(card);
+  });
+}
+
+function esc(s) { return String(s ?? "").replace(/"/g, "&quot;"); }
+
+function hint(text) { const p = document.createElement("p"); p.className = "hint"; p.textContent = text; return p; }
+
+function optionRow(qi, oi, name, desc, nameField, descPlaceholder) {
+  const wrap = document.createElement("div");
+  wrap.className = "opt";
+  const n = document.createElement("input");
+  n.value = name; n.placeholder = "name";
+  if (nameField === null) { n.disabled = true; } else {
+    n.oninput = () => { questions[qi].options[oi][0] = n.value; };
+  }
+  const d = document.createElement("input");
+  d.value = desc || ""; d.placeholder = descPlaceholder;
+  d.oninput = () => {
+    if (nameField === null) { questions[qi][oi === 0 ? "yes" : "no"] = d.value; }
+    else { questions[qi].options[oi][1] = d.value; }
+  };
+  wrap.append(n, d);
+  if (nameField !== null) {
+    const x = document.createElement("button");
+    x.className = "tiny"; x.textContent = "x";
+    x.onclick = () => { questions[qi].options.splice(oi, 1); renderQuestions(); };
+    wrap.append(x);
+  }
+  return wrap;
+}
+
+function levelRow(qi, li, value) {
+  const wrap = document.createElement("div");
+  wrap.className = "opt";
+  const n = document.createElement("input");
+  n.value = li; n.disabled = true; n.style.flex = "0 0 44px";
+  const d = document.createElement("input");
+  d.value = value; d.placeholder = "what this level means";
+  d.oninput = () => { questions[qi].levels[li] = d.value; };
+  const x = document.createElement("button");
+  x.className = "tiny"; x.textContent = "x";
+  x.onclick = () => { questions[qi].levels.splice(li, 1); renderQuestions(); };
+  wrap.append(n, d, x);
+  return wrap;
+}
+
+function addButton(qi, kind, text) {
+  const b = document.createElement("button");
+  b.className = "tiny"; b.textContent = text; b.style.marginTop = "6px";
+  b.onclick = () => {
+    if (kind === "option") questions[qi].options.push(["", ""]);
+    else questions[qi].levels.push("");
+    renderQuestions();
+  };
+  return b;
+}
+
+function buildRequest() {
+  const out = { state: $("context").value, model: "logit-latest", questions: {} };
+  questions.forEach(q => {
+    if (!q.id) return;
+    if (q.type === "choice") {
+      const criteria = {};
+      q.options.forEach(([name, desc]) => { if (name) criteria[name] = desc || null; });
+      out.questions[q.id] = { type: "choice", instructions: q.instructions, criteria };
+    } else if (q.type === "score") {
+      out.questions[q.id] = { type: "score", instructions: q.instructions, criteria: q.levels.filter(Boolean) };
+    } else {
+      const body = { type: "noul", instructions: q.instructions };
+      if (q.yes || q.no) body.criteria = { true: q.yes || null, false: q.no || null };
+      out.questions[q.id] = body;
+    }
+  });
+  return out;
+}
+
+function bars(entries, winner) {
+  return entries.map(([name, p]) => `
+    <div class="bar-row">
+      <span class="name ${name === winner ? "win" : ""}" title="${esc(name)}">${esc(name)}</span>
+      <span class="track"><span class="fill" style="width:${(p * 100).toFixed(1)}%"></span></span>
+      <span class="val">${p.toFixed(3)}</span>
+    </div>`).join("");
+}
+
+function renderAnswers(data) {
+  const host = $("answers");
+  const diag = data.diagnostics || {};
+  host.innerHTML = Object.entries(data.answers).map(([qid, a]) => {
+    let verdict = "", body = "", extra = "";
+    if (a.type === "choice") {
+      verdict = a.choice;
+      body = bars(Object.entries(a.probabilities).sort((x, y) => y[1] - x[1]), a.choice);
+      extra = `confidence ${a.confidence.toFixed(3)}`;
+    } else if (a.type === "score") {
+      verdict = a.score.toFixed(2);
+      body = bars(Object.entries(a.probabilities).map(([i, p]) => [`${i} ${a.legend[i]}`, p]), null);
+      extra = `confidence ${a.confidence.toFixed(3)}`;
+    } else {
+      verdict = a.noul >= 0.5 ? "yes" : "no";
+      body = bars([["yes", a.noul], ["no", 1 - a.noul]], a.noul >= 0.5 ? "yes" : "no");
+      extra = `P(true) ${a.noul.toFixed(4)}`;
+    }
+    const mass = (diag.candidate_mass || {})[qid];
+    const massNote = mass ? ` | label mass ${Math.min(...mass).toFixed(3)}` : "";
+    return `<div class="answer">
+      <div class="top"><span class="qid">${esc(qid)}</span><span class="verdict">${esc(verdict)}</span></div>
+      ${body}<div class="meta">${extra}${massNote}</div></div>`;
+  }).join("") || `<p class="hint">No answers returned.</p>`;
+
+  const bits = [`${data.usage.input_tokens} input tokens`, `${data.usage.output_tokens} scored positions`];
+  if (diag.latency_ms) bits.push(`${diag.latency_ms} ms`);
+  if (diag.temperature) bits.push(`T=${diag.temperature}`);
+  if (diag.score_method) bits.push(`score=${diag.score_method}`);
+  bits.push(`model ${data.model}`);
+  $("meta").textContent = bits.join("  |  ");
+}
+
+async function run() {
+  const btn = $("runBtn");
+  $("error").textContent = "";
+  btn.disabled = true; btn.textContent = "Classifying";
+  try {
+    const body = $("jsonView").classList.contains("hidden")
+      ? buildRequest() : JSON.parse($("jsonBody").value);
+    const res = await fetch("/v1/systemone?diagnostics=" + ($("diagBox").checked ? "1" : "0"), {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message ? `${data.error}: ${data.message}` + (data.field ? ` (${data.field})` : "") : JSON.stringify(data, null, 2));
+    lastResponse = data;
+    renderAnswers(data);
+    $("rawOut").textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+  } finally {
+    btn.disabled = false; btn.textContent = "Classify";
+  }
+}
+
+function showTab(which) {
+  const form = which === "form";
+  $("tabForm").ariaSelected = String(form);
+  $("tabJson").ariaSelected = String(!form);
+  $("formView").classList.toggle("hidden", !form);
+  $("jsonView").classList.toggle("hidden", form);
+  if (!form) $("jsonBody").value = JSON.stringify(buildRequest(), null, 2);
+}
+
+function showOut(which) {
+  const ans = which === "answers";
+  $("tabAnswers").ariaSelected = String(ans);
+  $("tabRaw").ariaSelected = String(!ans);
+  $("answers").classList.toggle("hidden", !ans);
+  $("rawOut").classList.toggle("hidden", ans);
+}
+
+function loadExample() {
+  $("context").value = EXAMPLE.context;
+  questions = JSON.parse(JSON.stringify(EXAMPLE.questions));
+  renderQuestions();
+  showTab("form");
+}
+
+document.querySelectorAll("[data-add]").forEach(b => {
+  b.onclick = () => { questions.push(blank(b.dataset.add)); renderQuestions(); };
+});
+$("runBtn").onclick = run;
+$("exampleBtn").onclick = loadExample;
+$("tabForm").onclick = () => showTab("form");
+$("tabJson").onclick = () => showTab("json");
+$("tabAnswers").onclick = () => showOut("answers");
+$("tabRaw").onclick = () => showOut("raw");
+$("themeBtn").onclick = () => {
+  const root = document.documentElement;
+  const next = root.dataset.theme === "dark" ? "light" : "dark";
+  root.dataset.theme = next;
+  try { localStorage.setItem("logit-theme", next); } catch (_) {}
+};
+try {
+  const saved = localStorage.getItem("logit-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+} catch (_) {}
+
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); run(); }
+});
+
+fetch("/healthz").then(r => r.json()).then(h => {
+  $("modelBadge").textContent = h.ready ? h.model_id : "loading model";
+}).catch(() => { $("modelBadge").textContent = "offline"; });
+
+loadExample();
+</script>
+</body>
+</html>

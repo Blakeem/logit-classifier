@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # A bare uv sync installs no extras, which keeps the multi-gigabyte hf extra out of CI.
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run ruff
+        run: uv run --no-sync ruff check .
+
+  mypy:
+    name: Mypy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # The service extra supplies the fastapi and pillow imports that service.py and vision.py make.
+      - name: Install dependencies
+        run: uv sync --locked --extra service
+
+      # The hf extra is not installed, so torch resolves as Any here. The strict torch
+      # check runs locally, where the extra is present.
+      - name: Run mypy
+        run: uv run --no-sync mypy
+
+  test:
+    name: Tests on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra service
+
+      # tests/test_model.py is named out because it needs model weights and a GPU.
+      - name: Run unit tests
+        run: uv run --no-sync python -m pytest tests/test_unit.py
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build the sdist and the wheel
+        run: uv build
+
+      # The browser page and the typing marker sit beside the modules rather than in
+      # them, so a packaging change can drop them without any test failing.
+      - name: Check the wheel carries its data files
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import glob, zipfile
+          wheel = sorted(glob.glob("dist/*.whl"))[-1]
+          names = set(zipfile.ZipFile(wheel).namelist())
+          for required in ("logit_classifier/web/index.html", "logit_classifier/py.typed"):
+              assert required in names, f"{required} is missing from {wheel}"
+          print(f"{wheel} carries its data files")
+          EOF
+
+      - name: Check the distributions
+        run: uvx twine check --strict dist/*

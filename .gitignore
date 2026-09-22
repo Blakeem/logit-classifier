@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.hf-cache/
+*.pyc
+calibration.json
+.pytest_cache/
+banking77_prior.json
+tests-AB/cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local Claude state, the project guide it reads, and the build plan
+.claude/
+CLAUDE.md
+TODO.md
+
+# Local machine paths, set per install from the README
+.env
+models/
