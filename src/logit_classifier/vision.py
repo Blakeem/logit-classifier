@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 
 IMAGE_KEYS = ("image", "screenshot")
 
+# What a state that held only an image renders as. A host passing its image beside the
+# state renders an empty state as this too, so both paths build the same prompt.
+IMAGE_ONLY_STATE = "(see image)"
+
 
 class ImageError(LogitClassifierError, ValueError):
     """The state named an image that could not be read."""
@@ -79,17 +83,27 @@ def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
     return cast("Image", opened)
 
 
-def extract_image(state: Any, *, allow_paths: bool = True) -> tuple[Any, Image | None]:
-    """Return the state with any image removed, and the image itself.
+def image_key(state: Any) -> str | None:
+    """Return the key a mapping state carries its image under, or None.
 
-    A state that is not a mapping carries no image, so it comes back untouched.
+    Only a non-empty string is an image, so any other value stays state content.
     """
     if not isinstance(state, dict):
-        return state, None
+        return None
 
     for key in IMAGE_KEYS:
         value = state.get(key)
         if isinstance(value, str) and value:
-            remainder = {k: v for k, v in state.items() if k != key}
-            return (remainder or "(see image)"), _decode(value, key, allow_paths=allow_paths)
-    return state, None
+            return key
+    return None
+
+
+def extract_image(state: Any, *, allow_paths: bool = True) -> tuple[Any, Image | None]:
+    """Return the state with any image removed, and the image itself."""
+    key = image_key(state)
+    remainder: dict[str, Any] = {}
+
+    if key is None:
+        return state, None
+    remainder = {k: v for k, v in state.items() if k != key}
+    return (remainder or IMAGE_ONLY_STATE), _decode(state[key], key, allow_paths=allow_paths)

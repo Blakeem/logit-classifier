@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from .schema import (
     NoulAnswer,
     NoulQuestion,
     Question,
+    SchemaError,
     ScoreAnswer,
     ScoreQuestion,
     SystemOneRequest,
@@ -41,7 +43,7 @@ from .scoring import (
     restricted_softmax,
     score_confidence,
 )
-from .vision import extract_image
+from .vision import IMAGE_ONLY_STATE, extract_image, image_key
 
 # The label prior is a property of the token and how many labels compete, so
 # branches sharing a shape share a bucket. A score's letter names a fixed rung, so a
@@ -85,6 +87,25 @@ def load_model(model_id: str | None = None, config: Config | None = None) -> Bac
             'Install it with: pip install "logit-classifier[hf]"'
         ) from error
     return HFBackend(config)
+
+
+def _beside_host_image(state: object) -> object:
+    """Return the state a host-supplied image is rendered beside.
+
+    An empty state renders as extract_image renders a state that held only an image, so
+    a host and the service build the same prompt for the same content.
+    """
+    carried = image_key(state)
+
+    if carried is not None:
+        raise SchemaError(
+            f"state carries an image under {carried!r} while image= was also given, "
+            f"so the request holds two images and one prefix reads one",
+            field=f"state.{carried}",
+        )
+    if state in ("", {}):
+        return IMAGE_ONLY_STATE
+    return state
 
 
 def _model_identity(backend: Backend) -> str:
@@ -191,8 +212,14 @@ class Classifier:
         return ids
 
     def classify(
-        self, request: SystemOneRequest, *, allow_image_paths: bool = True
+        self, request: SystemOneRequest, *, allow_image_paths: bool = True, image: Any = None
     ) -> tuple[SystemOneResponse, Diagnostics]:
+        """Answer every question in the request.
+
+        `image` is an image the host already decoded, which the state, being JSON, cannot
+        carry. Its type is whatever the backend's encode_prefix accepts: a PIL image for
+        HFBackend, a ComfyUI IMAGE tensor for ComfyClipBackend.
+        """
         rounds = self._letterings(request.questions)
         diagnostics = Diagnostics()
         probabilities: list[np.ndarray] = []
@@ -200,7 +227,10 @@ class Classifier:
         drafts: list[dict[str, Answer]] = []
         start = 0
 
-        state, image = extract_image(request.state, allow_paths=allow_image_paths)
+        if image is not None:
+            state = _beside_host_image(request.state)
+        else:
+            state, image = extract_image(request.state, allow_paths=allow_image_paths)
         seen = image is not None
         prefix_text = self.backend.render(
             SYSTEM_PROMPT, prefix_content(state, seen), ANSWER_PREFILL, open_ended=True

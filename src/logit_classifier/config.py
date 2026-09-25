@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._version import __version__
 from .errors import ConfigError
 
 # Jev caps a Choice at 255 options and a Score at 10 levels. Matching those caps
@@ -128,7 +129,7 @@ class Config:
     # weights beside the project instead, which is what the examples do.
     models_dir: Path | None = None
 
-    served_model_id: str = "logit-classifier-0.1.0"
+    served_model_id: str = f"logit-classifier-{__version__}"
     model_aliases: tuple[str, ...] = ("logit-latest", "logit-preview", "jev-latest", "jev-preview")
 
     # None asks for the backend model's fitted value, resolved by Classifier.

@@ -136,7 +136,8 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 # transformers publishes no complete stubs, and accelerate none at all. torch is
 # listed so the type gate still runs where the hf extra is absent, such as CI.
-module = ["transformers.*", "accelerate.*", "torch.*"]
+# The ComfyUI host supplies comfy, and neither this venv nor CI has it.
+module = ["transformers.*", "accelerate.*", "torch.*", "comfy.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -147,6 +148,12 @@ ignore_missing_imports = true
 module = ["logit_classifier.backends.hf"]
 disallow_untyped_calls = false
 disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+# torch leaves fp16_bf16_reduction_math_sdp_allowed unannotated, and a line ignore
+# would go unused, and so fail, where the hf extra is absent and torch is Any.
+module = ["logit_classifier.backends._torch_window"]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -159,7 +166,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/logit_classifier/__init__.py"
+path = "src/logit_classifier/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/logit_classifier"]

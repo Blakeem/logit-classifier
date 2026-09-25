@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import io
 import json
 import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 
 import numpy as np
@@ -39,6 +41,16 @@ from logit_classifier.scoring import (
     normalise_levels,
     restricted_softmax,
     score_confidence,
+)
+from logit_classifier.tags import (
+    MAX_CANDIDATES,
+    clean_item,
+    complete_tags,
+    drop_subsets,
+    normalize_item,
+    parse_candidates,
+    repeated_block,
+    split_prompt,
 )
 from logit_classifier.vision import ImageError, extract_image
 
@@ -482,6 +494,12 @@ class TestConfigEnv:
 
         assert Config().calibration_path is None
 
+    def test_the_served_model_id_follows_the_package_version(self):
+        # A hand-written copy would drift from __version__ on any bump that missed it.
+        from logit_classifier.config import Config
+
+        assert Config().served_model_id == f"logit-classifier-{__version__}"
+
     def test_a_switch_accepts_only_0_and_1(self, monkeypatch):
         # "false" used to read as True, which silently kept batching on.
         from logit_classifier.config import Config, ConfigError
@@ -644,13 +662,178 @@ class TestSchemaErrors:
         ]
 
 
+class TestCleanItem:
+    @pytest.mark.parametrize(("text", "item"), [
+        ("- cat", "cat"),
+        ("* dog", "dog"),
+        ("\u2022 bird", "bird"),
+        ("1. fish", "fish"),
+        ("2) frog", "frog"),
+        ("3.", ""),
+        ("2.5 liter bottle", "2.5 liter bottle"),
+        ("3d render", "3d render"),
+        ('"red hat."', "red hat"),
+        ("\u201cCat\u201d", "cat"),
+        ("\u2018dog\u2019", "dog"),
+        ("`fox`", "fox"),
+        ("  Red   Wooden\tChair.. ", "red wooden chair"),
+    ])
+    def test_cleans_one_item(self, text, item):
+        assert clean_item(text) == item
+
+
+class TestParseCandidates:
+    def test_splits_on_commas_semicolons_and_newlines(self):
+        assert parse_candidates("cat, dog; bird\nfish") == ["cat", "dog", "bird", "fish"]
+
+    def test_strips_list_bullets(self):
+        text = "- cat\n* dog\n\u2022 bird\n1. fish\n2) frog"
+
+        assert parse_candidates(text) == ["cat", "dog", "bird", "fish", "frog"]
+
+    def test_keeps_a_number_that_is_not_a_bullet(self):
+        assert parse_candidates("3d render, 2 cats") == ["3d render", "2 cats"]
+
+    def test_strips_quotes_and_trailing_periods(self):
+        assert parse_candidates('"cat", \'dog\', bird.') == ["cat", "dog", "bird"]
+        assert parse_candidates('"red hat."') == ["red hat"]
+
+    def test_drops_a_think_block(self):
+        assert parse_candidates("<think>\nmaybe a cat, a dog\n</think>\n\nfox, tree") == ["fox", "tree"]
+        assert parse_candidates("<think>still thinking, cat") == []
+
+    def test_drops_a_leading_assistant_line(self):
+        assert parse_candidates("assistant\nfox, tree") == ["fox", "tree"]
+        assert parse_candidates("fox\nassistant") == ["fox", "assistant"]
+
+    def test_lowercases_and_collapses_whitespace(self):
+        assert parse_candidates("Red   Wooden\tChair") == ["red wooden chair"]
+
+    def test_drops_empty_and_long_items(self):
+        seven_words = "one two three four five six seven"
+        six_words = "one two three four five six"
+        long_item = "a" * 61
+        edge_item = "a" * 60
+
+        candidates = parse_candidates(f"cat,, ,{seven_words},{six_words},{long_item},{edge_item}")
+        assert candidates == ["cat", six_words, edge_item]
+
+    def test_removes_duplicates_keeping_first_order(self):
+        assert parse_candidates("dog, cat, Dog, cat.") == ["dog", "cat"]
+
+    def test_caps_the_candidate_count(self):
+        text = ", ".join(f"tag {index}" for index in range(MAX_CANDIDATES + 5))
+
+        candidates = parse_candidates(text)
+        assert len(candidates) == MAX_CANDIDATES
+        assert candidates[-1] == f"tag {MAX_CANDIDATES - 1}"
+
+    def test_takes_its_limits_as_arguments(self):
+        text = "cat, black cat, big black cat, dog, bird"
+
+        assert parse_candidates(text, max_words=2) == ["cat", "black cat", "dog", "bird"]
+        assert parse_candidates(text, max_chars=3) == ["cat", "dog"]
+        assert parse_candidates(text, max_candidates=2) == ["cat", "black cat"]
+
+
+class TestCompleteTags:
+    def test_skips_the_tag_still_being_written(self):
+        assert complete_tags("man, man") == ["man"]
+        assert complete_tags("man, man,") == ["man", "man"]
+
+    def test_cleans_and_drops_empty_tags(self):
+        assert complete_tags("- Cat,, \n\u201cDog\u201d;fox") == ["cat", "dog"]
+
+
+class TestRepeatedBlock:
+    @pytest.mark.parametrize(("tags", "size"), [
+        (["man", "man"], 1),
+        (["man", "man with hat"], 0),
+        (["man", "manatee"], 0),
+        (["sky", "a", "b", "c", "a", "b", "c"], 3),
+        (["a", "b", "c", "d", "a", "b", "c", "d"], 4),
+        (["a", "b", "c", "d", "e", "a", "b", "c", "d", "e"], 0),
+        (["a", "b", "a"], 0),
+        ([], 0),
+    ])
+    def test_finds_only_a_back_to_back_block(self, tags, size):
+        assert repeated_block(tags) == size
+
+    def test_takes_the_largest_block_as_an_argument(self):
+        tags = ["a", "b", "c", "d", "e", "a", "b", "c", "d", "e"]
+
+        assert repeated_block(tags, max_block=5) == 5
+        assert repeated_block(["a", "b", "a", "b"], max_block=1) == 0
+
+    def test_returns_the_smallest_block(self):
+        assert repeated_block(["a", "a", "a", "a"]) == 1
+
+
+class TestSplitPrompt:
+    def test_splits_on_every_divider(self):
+        prompt = 'cat, dog; fox! owl? (hat) [cup] {pen} bee|ant/elk "yak" <emu>\nrat\rbat'
+
+        assert split_prompt(prompt) == [
+            "cat", "dog", "fox", "owl", "hat", "cup", "pen", "bee", "ant", "elk", "yak", "emu", "rat", "bat",
+        ]
+
+    def test_splits_on_a_period_or_colon_outside_a_number(self):
+        assert split_prompt("A cat. A dog: a fox") == ["a cat", "a dog", "a fox"]
+        assert split_prompt("a 2.5 liter bottle, 16:9 frame") == ["a 2.5 liter bottle", "16:9 frame"]
+        assert split_prompt("version 2. next") == ["version 2", "next"]
+
+    def test_strips_edge_characters_and_collapses_whitespace(self):
+        assert split_prompt("  *Big   Red\tHat_ , 'cat' , `-dog-`") == ["big red hat", "cat", "dog"]
+
+    def test_drops_a_part_with_no_letter_and_a_repeat(self):
+        assert split_prompt("cat, 42, --, Cat, 3.5, dog") == ["cat", "dog"]
+
+    def test_counts_a_non_ascii_letter(self):
+        assert split_prompt("caf\u00e9, 12") == ["caf\u00e9"]
+
+    def test_empty_prompt(self):
+        assert split_prompt("") == []
+
+
+class TestNormalizeItem:
+    @pytest.mark.parametrize(("text", "item"), [
+        ("the old man", "old man"),
+        ("and the man", "man"),
+        ("the", "the"),
+        ("a an", "an"),
+        ("with a hat of wool", "hat of wool"),
+        ("- The Old Man.", "old man"),
+        ("theater", "theater"),
+        ("", ""),
+    ])
+    def test_removes_leading_filler_words(self, text, item):
+        assert normalize_item(text) == item
+
+
+class TestDropSubsets:
+    def test_drops_an_item_another_item_holds(self):
+        assert drop_subsets(["herbs", "hanging dried herbs"]) == ["hanging dried herbs"]
+
+    def test_keeps_the_first_of_equal_word_sets(self):
+        assert drop_subsets(["red car", "car red"]) == ["red car"]
+
+    def test_splits_words_on_hyphens(self):
+        assert drop_subsets(["tomato", "sun-dried tomato", "dried sun"]) == ["sun-dried tomato"]
+
+    def test_keeps_order_and_unrelated_items(self):
+        assert drop_subsets(["sky", "red car", "car", "tree", "old tree"]) == ["sky", "red car", "old tree"]
+
+    def test_empty_list(self):
+        assert drop_subsets([]) == []
+
+
 class TestCoreIsolation:
     def test_importing_the_package_loads_no_host(self):
         # Prime directive 4. A ComfyUI pack imports this package beside ComfyUI's own
         # pinned CUDA build, so a stray top-level torch import would be a hard break.
         # A subprocess is the only honest check, since pytest has already imported PIL.
         probe = (
-            "import sys; import logit_classifier; "
+            "import sys; import logit_classifier; import logit_classifier.tags; "
             "print([m for m in ('torch', 'transformers', 'fastapi', 'PIL') if m in sys.modules])"
         )
         result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
@@ -715,7 +898,7 @@ class TestDeterminismWindow:
     # A host writing one slot directly is the case where the coarse getter raises.
     @pytest.mark.parametrize("baseline", ["pristine", "high", "new_api"])
     def test_the_window_pins_then_puts_every_slot_back(self, torch_host, baseline):
-        from logit_classifier.backends.hf import _determinism
+        from logit_classifier.backends._torch_window import _determinism
 
         # A host holding the opposite of every value we need. ComfyUI sets the sdp
         # reduction on at import. A bare --fast turns fp16 accumulation on as well.
@@ -748,7 +931,7 @@ class TestDeterminismWindow:
         assert self._snapshot(torch_host) == host
 
     def test_the_window_puts_them_back_after_a_failed_pass(self, torch_host):
-        from logit_classifier.backends.hf import _determinism
+        from logit_classifier.backends._torch_window import _determinism
 
         torch_host.backends.cuda.matmul.fp32_precision = "none"
         torch_host.backends.mkldnn.matmul.fp32_precision = "none"
@@ -757,6 +940,28 @@ class TestDeterminismWindow:
 
         with pytest.raises(RuntimeError), _determinism():
             raise RuntimeError("the forward pass blew up")
+
+        assert self._snapshot(torch_host) == host
+
+    def test_the_window_puts_them_back_when_a_pin_raises(self, torch_host, monkeypatch):
+        # An unusual torch build can refuse one setter after the earlier ones have landed.
+        from logit_classifier.backends._torch_window import _determinism
+
+        original = torch_host.backends.cuda.allow_fp16_bf16_reduction_math_sdp
+
+        def refuse_pinning(enabled):
+            if not enabled:
+                raise RuntimeError("this build refuses the sdp pin")
+            original(enabled)
+
+        torch_host.backends.cudnn.benchmark = True
+        torch_host.backends.cudnn.deterministic = False
+        torch_host.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)
+        host = self._snapshot(torch_host)
+        monkeypatch.setattr(torch_host.backends.cuda, "allow_fp16_bf16_reduction_math_sdp", refuse_pinning)
+
+        with pytest.raises(RuntimeError, match="refuses"), _determinism():
+            pass
 
         assert self._snapshot(torch_host) == host
 
@@ -1097,7 +1302,7 @@ class TestPublicSurface:
 
         for name in ("Backend", "BranchLogits", "BackendContractError", "ANSWER_PREFILL",
                      "MAX_LABELS_PER_BRANCH", "verify_label_ids", "verify_backend",
-                     "LogitClassifierError", "COMFY_SOCKET_TYPE"):
+                     "LogitClassifierError", "COMFY_SOCKET_TYPE", "UnsupportedModelError"):
             assert name in pkg.__all__, f"{name} is not exported from the package root"
             assert hasattr(pkg, name)
 
@@ -1291,3 +1496,781 @@ class TestScoreScatter:
 
     def test_no_suffixes_returns_nothing(self):
         assert self._backend().score(list(range(90)), [], []) == []
+
+
+# The Qwen chat tokens a ComfyUI Qwen tokenizer keeps whole, at their real ids.
+_QWEN_SPECIAL: dict[str, int] = {
+    "<|im_start|>": 151644,
+    "<|im_end|>": 151645,
+    "<|vision_start|>": 151652,
+    "<|vision_end|>": 151653,
+    "<|image_pad|>": 151655,
+}
+_FAKE_VOCAB = 151700
+# The fake vision tower expands the one image entry into this many embeddings, and the
+# text after it resumes this far past the image's start, as MRoPE's grid positions do.
+_FAKE_PATCHES = 6
+_FAKE_GRID = 3
+_COMFY_CLIP_SOURCE = (
+    Path(__file__).resolve().parents[1] / "src" / "logit_classifier" / "backends" / "comfy_clip.py"
+)
+
+
+class FakeHFTokenizer:
+    """Qwen2Tokenizer reduced to one id per chat token and one per character."""
+
+    def __init__(self, chat_tokens=True):
+        self.special = _QWEN_SPECIAL if chat_tokens else {}
+
+    def encode(self, text, add_special_tokens=True):
+        ids = []
+        for piece in re.split(r"(<\|[a-z_]+\|>)", text):
+            ids.extend([self.special[piece]] if piece in self.special else [ord(c) for c in piece])
+        return ids
+
+
+class FakeSDTokenizer:
+    """comfy/sd1_clip.py SDTokenizer, down to the three rewrites that make it unfit for encode."""
+
+    def __init__(self, chat_tokens=True):
+        self.tokenizer = FakeHFTokenizer(chat_tokens)
+
+    def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
+        text = text.replace("\\(", "(").replace("\\)", ")")
+        words = [word for word in text.split(" ") if not word.startswith("embedding:")]
+        ids = self.tokenizer.encode(" ".join(words)) or [151643]
+        return [[(token, 1.0) for token in ids]]
+
+
+class FakeSD1Tokenizer:
+    def __init__(self, name, chat_tokens=True):
+        self.clip_name = name
+        self.clip = name
+        setattr(self, name, FakeSDTokenizer(chat_tokens))
+
+    def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
+        inner = getattr(self, self.clip)
+        return {self.clip_name: inner.tokenize_with_weights(text, return_word_ids, **kwargs)}
+
+
+class FakeQwenTransformer:
+    """Qwen3VL from comfy/text_encoders/qwen3vl.py and llama.py, over fixed rows.
+
+    The packed forward's first hidden channel counts the positions each row sees, which
+    is the length the generate path's row carries for the same branch without an image.
+    The second channel is the token id, so a test can find each token in the sequence.
+    """
+
+    def __init__(self, visual=True):
+        if visual:
+            self.visual = object()
+        self.fail = False
+        self.forward_error = None
+        self.pinned = []
+        self.inference = []
+        self.generated = []
+        self.forwards = []
+        self.logit_inputs = []
+        self.image_inputs = 0
+        self.deepstack = [object()]
+        self.model = SimpleNamespace(forward=self.packed_forward)
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def embed(self, ids, out_dtype=None):
+        return ids.to(out_dtype).unsqueeze(-1)
+
+    def build_image_inputs(self, embeds, embeds_info):
+        import torch
+
+        self.image_inputs += 1
+        if not embeds_info:
+            return None, None, None
+        (image,) = embeds_info
+        seq = embeds.shape[1]
+        start = image["index"]
+        end = start + image["size"]
+        positions = torch.zeros((3, seq))
+        positions[:, :start] = torch.arange(start)
+        positions[:, start:end] = start
+        positions[:, end:] = torch.arange(seq - end) + start + _FAKE_GRID
+        visual_mask = torch.zeros((1, seq), dtype=torch.bool)
+        visual_mask[0, start:end] = True
+        return positions, visual_mask, self.deepstack
+
+    def packed_forward(self, x, embeds=None, attention_mask=None, position_ids=None, deepstack_embeds=None,
+                       visual_pos_masks=None, embeds_info=None):
+        import torch
+
+        self.forwards.append({
+            "embeds": embeds, "attention_mask": attention_mask, "position_ids": position_ids,
+            "deepstack_embeds": deepstack_embeds, "visual_pos_masks": visual_pos_masks,
+            "embeds_info": embeds_info, "pinned": torch.backends.cudnn.deterministic,
+            "inference": torch.is_inference_mode_enabled(),
+        })
+        if self.forward_error is not None:
+            raise self.forward_error
+        visible = attention_mask[0].sum(dim=-1).to(embeds.dtype)
+        return torch.stack([visible, embeds[0, :, 0]], dim=-1).unsqueeze(0), None
+
+    def logits(self, x):
+        import torch
+
+        self.logit_inputs.append(x)
+        rows = torch.full((*x.shape[:-1], _FAKE_VOCAB), -20.0)
+        rows[..., ord("A")] = x[..., 0].float()
+        rows[..., ord("B")] = 0.0
+        return rows
+
+    def row(self, tokens):
+        import torch
+
+        # The winning logit is the sequence length, so every branch reads back its own row.
+        row = torch.full((_FAKE_VOCAB,), -20.0)
+        row[ord("A")] = float(len(tokens))
+        row[ord("B")] = 0.0
+        return row
+
+    def sample_token(self, logits, temperature, top_k, top_p, min_p, repetition_penalty, token_history,
+                     generator, do_sample=True, presence_penalty=0.0, penalty_mask=None):
+        import torch
+
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    def generate(self, tokens, do_sample, max_length, temperature, top_k, top_p, min_p, repetition_penalty,
+                 seed, presence_penalty=0.0):
+        import torch
+
+        self.pinned.append(torch.backends.cudnn.deterministic)
+        self.inference.append(torch.is_inference_mode_enabled())
+        if self.fail:
+            raise RuntimeError("the forward pass blew up")
+        generator = None
+        penalty_mask = None
+        decode_tokens = torch.empty((1, 1), dtype=torch.long)
+        generated = []
+        for _ in range(max_length):
+            logits = self.row(tokens[0])[None, :]
+            next_token = self.sample_token(logits, temperature, top_k, top_p, min_p, repetition_penalty, [],
+                                           generator, do_sample=do_sample, presence_penalty=presence_penalty,
+                                           penalty_mask=penalty_mask)
+            decode_tokens.copy_(next_token)
+            generated.append(decode_tokens[0].item())
+        self.generated.append(generated)
+        return generated
+
+
+class FakeQwenClipModel:
+    """Qwen3VLClipModel.generate: drops the weights and hands the ids to the transformer."""
+
+    def __init__(self, transformer):
+        self.transformer = transformer
+        self.processed = []
+        self.vision_runs = 0
+
+    def process_tokens(self, tokens, device):
+        """SDClipModel.process_tokens, which reads bare ids and dicts and expands each image."""
+        import torch
+
+        self.processed.append(tokens)
+        values = []
+        info = []
+        for token in tokens[0]:
+            if isinstance(token, dict):
+                assert set(token) == {"type", "data", "original_type"}
+                assert token["type"] == "image" and token["original_type"] == "image"
+                self.vision_runs += 1
+                info.append({"type": "image", "index": len(values), "size": _FAKE_PATCHES, "extra": {}})
+                values.extend([-1.0] * _FAKE_PATCHES)
+            else:
+                # Core calls .get on anything that is not an int, so a weighted pair raises there.
+                assert type(token) is int, f"process_tokens reads bare ids, got {token!r}"
+                values.append(float(token))
+        embeds = torch.tensor(values, device=device).view(1, -1, 1)
+        return embeds, torch.ones((1, len(values)), dtype=torch.long), [len(values)], info
+
+    def generate(self, tokens, do_sample, max_length, temperature, top_k, top_p, min_p, repetition_penalty,
+                 seed, presence_penalty=0.0, mtp=True):
+        if isinstance(tokens, dict):
+            tokens = next(iter(tokens.values()))
+        tokens_only = [[t[0] for t in b] for b in tokens]
+        return self.transformer.generate(tokens_only, do_sample, max_length, temperature, top_k, top_p, min_p,
+                                         repetition_penalty, seed, presence_penalty=presence_penalty)
+
+
+class FakeTEModel:
+    def __init__(self, name, clip_model):
+        self.clip_name = name
+        self.clip = name
+        self.events = []
+        setattr(self, name, clip_model)
+
+    def reset_clip_options(self):
+        self.events.append("reset")
+
+    def set_clip_options(self, options):
+        self.events.append(options)
+
+    def generate(self, tokens, **kwargs):
+        return getattr(self, self.clip).generate(tokens, **kwargs)
+
+
+class FakeClip:
+    """comfy.sd.CLIP, which defines generate and decode whatever encoder it holds."""
+
+    def __init__(self, name="qwen3vl_4b", transformer=None, chat_tokens=True):
+        self.transformer = transformer if transformer is not None else FakeQwenTransformer()
+        self.tokenizer = FakeSD1Tokenizer(name, chat_tokens)
+        self.cond_stage_model = FakeTEModel(name, FakeQwenClipModel(self.transformer))
+        self.patcher = SimpleNamespace(load_device="cpu")
+        self.calls = []
+
+    def load_model(self, tokens=None):
+        self.cond_stage_model.events.append(("load", tokens))
+        return self.patcher
+
+    def tokenize(self, text, return_word_ids=False, **kwargs):
+        return self.tokenizer.tokenize_with_weights(text, return_word_ids, **kwargs)
+
+    def generate(self, tokens, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.95,
+                 min_p=0.0, repetition_penalty=1.0, seed=None, presence_penalty=0.0, mtp=True):
+        self.calls.append({"tokens": tokens, "do_sample": do_sample, "max_length": max_length})
+        return self.cond_stage_model.generate(
+            tokens, do_sample=do_sample, max_length=max_length, temperature=temperature, top_k=top_k,
+            top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty, seed=seed,
+            presence_penalty=presence_penalty, mtp=mtp,
+        )
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return ""
+
+
+@pytest.fixture
+def fake_comfy(monkeypatch):
+    """comfy.model_management and comfy.ops, down to the three calls the packed pass makes."""
+    state = SimpleNamespace(bf16=False, devices=[], quantized=[])
+    comfy = ModuleType("comfy")
+    management = ModuleType("comfy.model_management")
+    ops = ModuleType("comfy.ops")
+
+    @contextlib.contextmanager
+    def cuda_device_context(device):
+        state.devices.append(device)
+        yield
+
+    @contextlib.contextmanager
+    def use_quantized_matmul(model, device):
+        state.quantized.append((model, device))
+        yield
+
+    management.should_use_bf16 = lambda device=None: state.bf16
+    management.cuda_device_context = cuda_device_context
+    ops.use_quantized_matmul = use_quantized_matmul
+    comfy.model_management = management
+    comfy.ops = ops
+    for name, module in (("comfy", comfy), ("comfy.model_management", management), ("comfy.ops", ops)):
+        monkeypatch.setitem(sys.modules, name, module)
+    return state
+
+
+class TestComfyClipBackend:
+    """A Backend over a ComfyUI Qwen3-VL CLIP, proven against core's call shapes."""
+
+    def _backend(self, clip=None, **kwargs):
+        from logit_classifier.backends.comfy_clip import ComfyClipBackend
+
+        return ComfyClipBackend(clip if clip is not None else FakeClip(), **kwargs)
+
+    def test_importing_it_loads_no_host(self):
+        # The module sits beside ComfyUI's own torch, and CI has neither torch nor comfy.
+        probe = (
+            "import sys; from logit_classifier.backends.comfy_clip import ComfyClipBackend; "
+            "print([m for m in ('torch', 'transformers', 'comfy') if m in sys.modules])"
+        )
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+        assert result.stdout.strip() == "[]"
+
+    def test_a_clip_l_shaped_clip_is_rejected_at_construction(self):
+        from logit_classifier.backends.base import UnsupportedModelError
+
+        clip_l = FakeClip(name="clip_l", transformer=SimpleNamespace())
+        with pytest.raises(UnsupportedModelError, match="Qwen3-VL"):
+            self._backend(clip_l)
+
+    def test_a_generating_model_without_the_qwen_chat_tokens_is_rejected(self):
+        # The render is the Qwen template, which another family would read as plain text.
+        from logit_classifier.backends.base import UnsupportedModelError
+
+        with pytest.raises(UnsupportedModelError, match="Krea 2"):
+            self._backend(FakeClip(name="llama3", chat_tokens=False))
+
+    @pytest.mark.parametrize("encoder", ["qwen25_7b", "qwen35_4b", "qwen3_4b"])
+    def test_another_generating_qwen_encoder_is_rejected(self, encoder):
+        # Qwen2.5-VL and Qwen3.5 pass every other check, then read an image at 1D positions.
+        from logit_classifier.backends.base import UnsupportedModelError
+
+        with pytest.raises(UnsupportedModelError, match="Qwen3-VL"):
+            self._backend(FakeClip(name=encoder))
+
+    def test_it_meets_the_port_and_proves_its_labels(self):
+        from logit_classifier.backends.base import Backend
+        from logit_classifier.labels import LABEL_ALPHABET
+
+        backend = self._backend()
+        assert isinstance(backend, Backend)
+        assert backend.label_ids == [ord(label) for label in LABEL_ALPHABET]
+
+    @pytest.mark.parametrize(
+        ("encoder", "model_id", "temperature"),
+        [
+            ("qwen3vl_4b", "Qwen/Qwen3-VL-4B-Instruct", 1.25),
+            ("qwen3vl_8b", "Qwen/Qwen3-VL-8B-Instruct", 2.5),
+            ("qwen3vl_32b", "qwen3vl_32b", 2.5),
+        ],
+    )
+    def test_the_encoder_name_picks_the_fitted_temperature(self, encoder, model_id, temperature):
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        backend = self._backend(FakeClip(name=encoder))
+        assert backend.model_id == model_id
+        assert backend.canonical_model_id == model_id
+        assert Classifier(Config(), backend).temperature == temperature
+
+    def test_a_keyword_overrides_the_model_id(self):
+        assert self._backend(FakeClip(name="qwen3vl_8b"), model_id="mine").model_id == "mine"
+
+    def test_sees_images_follows_the_vision_tower(self):
+        assert self._backend().sees_images is True
+        assert self._backend(FakeClip(transformer=FakeQwenTransformer(visual=False))).sees_images is False
+
+    def test_the_render_is_the_qwen_chat_template(self):
+        backend = self._backend()
+        opened = "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU"
+        assert backend.render("S", "U", "Answer: (") == (
+            f"{opened}<|im_end|>\n<|im_start|>assistant\nAnswer: ("
+        )
+        assert backend.render("S", "U", "Answer: (", open_ended=True) == opened
+
+    def test_the_render_matches_hf_backend(self):
+        pytest.importorskip("torch")
+        transformers = pytest.importorskip("transformers")
+        from logit_classifier.backends.hf import HFBackend
+
+        try:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                "Qwen/Qwen3-VL-4B-Instruct", cache_dir=Path(__file__).resolve().parents[1] / "models",
+                local_files_only=True,
+            )
+        except OSError:
+            pytest.skip("the Qwen3-VL-4B-Instruct tokenizer is not in the local models cache")
+        hf = SimpleNamespace(tokenizer=tokenizer)
+        backend = self._backend()
+        user = prefix_content("a state", True) + "Question: which?"
+        for open_ended in (False, True):
+            ours = backend.render("a system", user, ANSWER_PREFILL, open_ended=open_ended)
+            assert ours == HFBackend.render(hf, "a system", user, ANSWER_PREFILL, open_ended=open_ended)
+
+    def test_encode_reads_the_tokenizer_rather_than_clip_tokenize(self):
+        clip = FakeClip()
+        text = "a \\(b\\) embedding:foo"
+        rewritten = [token for token, _ in clip.tokenize(text)["qwen3vl_4b"][0]]
+        expected = FakeHFTokenizer().encode(text, add_special_tokens=False)
+        assert rewritten != expected
+        assert self._backend(clip).encode(text) == expected
+
+    def test_a_prefix_without_an_image_is_plain_ids(self):
+        backend = self._backend()
+        assert backend.encode_prefix("text") == (backend.encode("text"), {})
+
+    def test_an_image_on_a_text_only_clip_is_refused(self):
+        from logit_classifier.backends.base import VisionUnsupportedError
+
+        backend = self._backend(FakeClip(transformer=FakeQwenTransformer(visual=False)))
+        with pytest.raises(VisionUnsupportedError):
+            backend.encode_prefix(IMAGE_MARKER, SimpleNamespace(shape=(1, 8, 8, 3)))
+
+    @pytest.mark.parametrize(("text", "count"), [("no marker", 0), (IMAGE_MARKER * 2, 2)])
+    def test_an_image_needs_exactly_one_pad_token(self, text, count):
+        torch = pytest.importorskip("torch")
+        with pytest.raises(ImageError, match=f"holds {count} "):
+            self._backend().encode_prefix(text, torch.zeros(1, 8, 8, 3))
+
+    def test_an_image_batch_is_refused(self):
+        torch = pytest.importorskip("torch")
+        with pytest.raises(ImageError, match="got shape"):
+            self._backend().encode_prefix(IMAGE_MARKER, torch.zeros(2, 8, 8, 3))
+
+    def test_an_image_that_is_not_a_float_tensor_is_refused(self):
+        # Core's vision path reads images.device, so a numpy array would fail deep inside it.
+        torch = pytest.importorskip("torch")
+        backend = self._backend()
+        for image in (np.zeros((1, 8, 8, 3), dtype=np.float32), torch.zeros(1, 8, 8, 3, dtype=torch.uint8)):
+            with pytest.raises(ImageError, match="float torch tensor"):
+                backend.encode_prefix(IMAGE_MARKER, image)
+
+    def test_score_puts_the_image_back_in_core_form(self):
+        torch = pytest.importorskip("torch")
+        clip = FakeClip()
+        backend = self._backend(clip)
+        image = torch.zeros(1, 8, 8, 3)
+        prefix_ids, vision = backend.encode_prefix(f"Context:\n{IMAGE_MARKER}\n", image)
+        backend._score_by_generate(prefix_ids, [backend.encode("x")], [2], vision)
+
+        call = clip.calls[0]
+        entry, weight = call["tokens"]["qwen3vl_4b"][0][vision["pad_index"]]
+        assert entry["type"] == "image"
+        assert entry["original_type"] == "image"
+        assert entry["data"] is image
+        assert weight == 1.0
+        assert call["do_sample"] is False
+        assert call["max_length"] == 1
+
+    @pytest.mark.usefixtures("fake_comfy")
+    def test_score_returns_one_row_per_branch_in_order(self):
+        pytest.importorskip("torch")
+        backend = self._backend()
+        prefix = backend.encode("prefix")
+        suffixes = [backend.encode("s" * n) for n in (5, 1, 9)]
+        rows = backend.score(prefix, suffixes, [2, 3, 52])
+
+        assert [row.z.shape[0] for row in rows] == [2, 3, 52]
+        for row, suffix in zip(rows, suffixes, strict=True):
+            winner = float(len(prefix) + len(suffix))
+            labels = np.array([winner, 0.0] + [-20.0] * (row.z.shape[0] - 2))
+            vocab = np.full(_FAKE_VOCAB, -20.0)
+            vocab[ord("A")] = winner
+            vocab[ord("B")] = 0.0
+            expected = np.exp(np.logaddexp.reduce(labels) - np.logaddexp.reduce(vocab))
+            assert row.z.dtype == np.float64
+            assert np.array_equal(row.z, labels)
+            assert row.candidate_mass == pytest.approx(expected, rel=1e-5)
+
+    def test_the_sampled_token_still_reaches_decode(self):
+        pytest.importorskip("torch")
+        clip = FakeClip()
+        backend = self._backend(clip)
+        backend._score_by_generate(backend.encode("p"), [backend.encode("q")], [2])
+        assert clip.transformer.generated == [[ord("A")]]
+
+    def test_sample_token_is_restored_after_a_pass_and_after_a_failure(self):
+        pytest.importorskip("torch")
+        clip = FakeClip()
+        backend = self._backend(clip)
+        backend._score_by_generate(backend.encode("p"), [backend.encode("q")], [2])
+        assert "sample_token" not in vars(clip.transformer)
+
+        clip.transformer.fail = True
+        with pytest.raises(RuntimeError, match="blew up"):
+            backend._score_by_generate(backend.encode("p"), [backend.encode("q")], [2])
+        assert "sample_token" not in vars(clip.transformer)
+
+    def test_every_generate_is_pinned_and_under_inference_mode(self):
+        torch = pytest.importorskip("torch")
+        clip = FakeClip()
+        backend = self._backend(clip)
+        saved = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = False
+        try:
+            backend._score_by_generate(backend.encode("p"), [backend.encode("q"), backend.encode("r")], [2, 2])
+            assert clip.transformer.pinned == [True, True]
+            assert clip.transformer.inference == [True, True]
+            assert torch.backends.cudnn.deterministic is False
+
+            clip.transformer.fail = True
+            with pytest.raises(RuntimeError):
+                backend._score_by_generate(backend.encode("p"), [backend.encode("q")], [2])
+            assert clip.transformer.pinned[-1] is True
+            assert torch.backends.cudnn.deterministic is False
+        finally:
+            torch.backends.cudnn.deterministic = saved
+
+    def test_every_generate_sits_inside_the_window(self):
+        # The runtime test above sees the fake's calls only, so this reads the source.
+        tree = ast.parse(_COMFY_CLIP_SOURCE.read_text(encoding="utf-8"))
+
+        def generate_calls(node):
+            return {id(inner) for inner in ast.walk(node)
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "generate"}
+
+        covered = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.With) and any(
+                isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "_determinism"
+                for item in node.items
+            ):
+                covered |= generate_calls(node)
+
+        every = generate_calls(tree)
+        assert every, "found no generate call, so this guard is no longer watching anything"
+        assert every == covered
+
+
+@pytest.mark.usefixtures("fake_comfy")
+class TestComfyPackedScore:
+    """score's default path, one forward per pass of packed suffixes behind one prefix."""
+
+    def _setup(self, *, batch_branches=True):
+        torch = pytest.importorskip("torch")
+        from logit_classifier.backends.comfy_clip import ComfyClipBackend
+
+        clip = FakeClip()
+        return torch, clip, ComfyClipBackend(clip, batch_branches=batch_branches)
+
+    def _image_prefix(self, torch, backend):
+        # "p", the three marker tokens and "q", so the prefix is 4 + _FAKE_PATCHES embeddings long.
+        return backend.encode_prefix(f"p{IMAGE_MARKER}q", torch.zeros(1, 8, 8, 3))
+
+    def test_the_prefix_reaches_process_tokens_as_bare_ids_and_one_image_dict(self, fake_comfy):
+        torch, clip, backend = self._setup()
+        image = torch.zeros(1, 8, 8, 3)
+        prefix_ids, vision = backend.encode_prefix(f"Context:\n{IMAGE_MARKER}\n", image)
+        backend.score(prefix_ids, [backend.encode("x")], [2], vision)
+
+        ((sequence,),) = clip.cond_stage_model.qwen3vl_4b.processed
+        pad = vision["pad_index"]
+        assert sequence[pad]["data"] is image
+        assert [token for i, token in enumerate(sequence) if i != pad] == [
+            token for i, token in enumerate(prefix_ids) if i != pad
+        ]
+        assert clip.cond_stage_model.events == [
+            "reset",
+            ("load", {"qwen3vl_4b": [sequence]}),
+            {"layer": None, "execution_device": "cpu"},
+        ]
+        assert fake_comfy.devices == ["cpu"]
+        assert fake_comfy.quantized == [(clip.cond_stage_model, "cpu")]
+        assert clip.calls == []
+
+    def test_every_suffix_sits_after_the_image_expanded_prefix(self):
+        torch, clip, backend = self._setup()
+        prefix_ids, vision = self._image_prefix(torch, backend)
+        backend.score(prefix_ids, [backend.encode("ab"), backend.encode("cde")], [2, 2], vision)
+
+        (forward,) = clip.transformer.forwards
+        prefix_length = len(prefix_ids) - 1 + _FAKE_PATCHES
+        assert forward["embeds"].shape[1] == prefix_length + 5
+        assert forward["embeds"][0, prefix_length:, 0].tolist() == [float(ord(c)) for c in "abcde"]
+        pad = vision["pad_index"]
+        expected_mask = [pad <= i < pad + _FAKE_PATCHES for i in range(prefix_length + 5)]
+        assert forward["visual_pos_masks"][0].tolist() == expected_mask
+        assert forward["deepstack_embeds"] is clip.transformer.deepstack
+        assert forward["embeds_info"][0]["size"] == _FAKE_PATCHES
+
+    def test_each_suffix_restarts_after_the_largest_image_position(self):
+        torch, clip, backend = self._setup()
+        prefix_ids, vision = self._image_prefix(torch, backend)
+        backend.score(prefix_ids, [backend.encode("ab"), backend.encode("cde")], [2, 2], vision)
+
+        positions = clip.transformer.forwards[0]["position_ids"]
+        # The patches sit at 2, the text after them resumes at 2 + _FAKE_GRID, and the
+        # prefix's largest position is 6, so each suffix restarts at 7.
+        expected = [0, 1, 2, 2, 2, 2, 2, 2, 5, 6, 7, 8, 7, 8, 9]
+        assert positions.shape == (3, len(expected))
+        assert [row.tolist() for row in positions] == [expected] * 3
+
+    def test_each_suffix_restarts_after_a_text_only_prefix(self):
+        _, clip, backend = self._setup()
+        backend.score(backend.encode("pq"), [backend.encode("ab"), backend.encode("cde")], [2, 2])
+
+        forward = clip.transformer.forwards[0]
+        assert forward["position_ids"].tolist() == [[0, 1, 2, 3, 2, 3, 4]]
+        assert forward["visual_pos_masks"] is None
+        assert forward["deepstack_embeds"] is None
+
+    def test_the_mask_lets_a_suffix_see_the_prefix_and_itself_only(self):
+        _, clip, backend = self._setup()
+        backend.score(backend.encode("pq"), [backend.encode("ab"), backend.encode("cde")], [2, 2])
+
+        mask = clip.transformer.forwards[0]["attention_mask"]
+        assert mask.shape == (1, 7, 7)
+        assert mask[0].tolist() == [
+            [1, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 0, 0, 1, 0, 0],
+            [1, 1, 0, 0, 1, 1, 0],
+            [1, 1, 0, 0, 1, 1, 1],
+        ]
+
+    def test_the_row_is_read_at_each_suffix_last_position(self):
+        _, clip, backend = self._setup()
+        rows = backend.score(backend.encode("pq"), [backend.encode("ab"), backend.encode("cde")], [2, 3])
+
+        (gathered,) = clip.transformer.logit_inputs
+        assert gathered.shape == (2, 1, 2)
+        assert gathered[:, 0, 1].tolist() == [float(ord("b")), float(ord("e"))]
+        assert [row.z.tolist() for row in rows] == [[4.0, 0.0], [5.0, 0.0, -20.0]]
+
+    @pytest.mark.parametrize("bf16", [True, False])
+    def test_embeds_run_in_the_dtype_core_generate_picks(self, fake_comfy, bf16):
+        torch, clip, backend = self._setup()
+        fake_comfy.bf16 = bf16
+        backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+        expected = torch.bfloat16 if bf16 else torch.float32
+        assert clip.transformer.forwards[0]["embeds"].dtype == expected
+
+    def test_passes_split_at_the_ceiling_and_rows_return_in_request_order(self, monkeypatch):
+        from logit_classifier.backends import comfy_clip
+
+        torch, clip, backend = self._setup()
+        monkeypatch.setattr(comfy_clip, "PACKED_TOKEN_CEILING", 22)
+        prefix_ids, vision = self._image_prefix(torch, backend)
+        lengths = [5, 7, 1, 9, 12, 20]
+        rows = backend.score(prefix_ids, [[ord("s")] * n for n in lengths], [2] * len(lengths), vision)
+
+        # The prefix is 10 embeddings, so 10+5+7 fills a pass, 10+1+9 cannot take 12,
+        # and 20 cannot share a pass, so it runs alone over the ceiling.
+        widths = [forward["attention_mask"].shape[-1] for forward in clip.transformer.forwards]
+        assert widths == [22, 20, 22, 30]
+        assert [float(row.z[0]) for row in rows] == [10.0 + n for n in lengths]
+
+    def test_the_vision_tower_runs_once_for_a_request_of_two_passes(self, monkeypatch):
+        from logit_classifier.backends import comfy_clip
+
+        torch, clip, backend = self._setup()
+        monkeypatch.setattr(comfy_clip, "PACKED_TOKEN_CEILING", 20)
+        prefix_ids, vision = self._image_prefix(torch, backend)
+        backend.score(prefix_ids, [[ord("s")] * 10, [ord("s")] * 10], [2, 2], vision)
+
+        assert len(clip.transformer.forwards) == 2
+        assert len(clip.cond_stage_model.qwen3vl_4b.processed) == 1
+        assert clip.cond_stage_model.qwen3vl_4b.vision_runs == 1
+        assert clip.transformer.image_inputs == 1
+
+    def test_batching_off_gives_every_suffix_its_own_pass(self):
+        _, clip, backend = self._setup(batch_branches=False)
+        suffixes = [backend.encode(text) for text in ("ab", "cde", "f")]
+        rows = backend.score(backend.encode("pq"), suffixes, [2, 2, 2])
+
+        assert [forward["attention_mask"].shape[-1] for forward in clip.transformer.forwards] == [4, 5, 3]
+        assert [float(row.z[0]) for row in rows] == [4.0, 5.0, 3.0]
+
+    def test_a_moved_core_internal_falls_back_once_and_stays_there(self):
+        _, clip, backend = self._setup()
+        clip.transformer.model = SimpleNamespace()
+        suffixes = [backend.encode("ab"), backend.encode("cde")]
+        with pytest.warns(RuntimeWarning, match="per-branch generate path"):
+            rows = backend.score(backend.encode("pq"), suffixes, [2, 2])
+
+        assert len(clip.calls) == 2
+        assert [float(row.z[0]) for row in rows] == [4.0, 5.0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            backend.score(backend.encode("pq"), suffixes, [2, 2])
+        assert len(clip.cond_stage_model.qwen3vl_4b.processed) == 1
+        assert len(clip.calls) == 4
+
+    def test_a_fallback_that_fails_too_reaches_the_caller_and_keeps_packing_on(self):
+        _, clip, backend = self._setup()
+        model = clip.transformer.model
+        generate = clip.generate
+        clip.transformer.model = SimpleNamespace()
+
+        def broken_generate(*args, **kwargs):
+            raise AttributeError("'numpy.ndarray' object has no attribute 'device'")
+
+        clip.generate = broken_generate
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(AttributeError, match="device"):
+                backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+        assert backend._packed_failed is False
+
+        clip.transformer.model = model
+        clip.generate = generate
+        backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+        assert len(clip.transformer.forwards) == 1
+        assert clip.calls == []
+
+    def test_any_other_failure_reaches_the_caller_without_a_fallback(self):
+        _, clip, backend = self._setup()
+        clip.transformer.forward_error = RuntimeError("CUDA out of memory")
+        with pytest.raises(RuntimeError, match="out of memory"):
+            backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+        assert clip.calls == []
+
+        clip.transformer.forward_error = None
+        backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+        assert len(clip.transformer.forwards) == 2
+        assert clip.calls == []
+
+    def test_the_pass_is_pinned_and_under_inference_mode(self):
+        torch, clip, backend = self._setup()
+        saved = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = False
+        try:
+            backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+            assert clip.transformer.forwards[0]["pinned"] is True
+            assert clip.transformer.forwards[0]["inference"] is True
+            assert torch.backends.cudnn.deterministic is False
+        finally:
+            torch.backends.cudnn.deterministic = saved
+
+
+class ImageRecordingBackend(StubBackend):
+    sees_images = True
+
+    def __init__(self):
+        self.prefixes = []
+
+    def encode_prefix(self, text, image=None):
+        self.prefixes.append((text, image))
+        return self.encode(text), {}
+
+
+class TestHostImage:
+    """Classifier.classify(image=...), the path a host holding a decoded image takes."""
+
+    def _classify(self, state, **kwargs):
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        backend = ImageRecordingBackend()
+        request = parse_request({"state": state, "questions": {"q": {"type": "noul"}}})
+        Classifier(Config(), backend).classify(request, **kwargs)
+        return backend.prefixes[0]
+
+    def _png_url(self):
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), "red").save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def test_the_image_reaches_encode_prefix_with_the_marker(self):
+        host_image = object()
+        text, image = self._classify("a cat", image=host_image)
+        assert image is host_image
+        assert IMAGE_MARKER in text
+        assert "a cat" in text
+
+    @pytest.mark.parametrize("state", ["", {}])
+    def test_an_empty_state_renders_as_the_service_renders_an_image_only_state(self, state):
+        host_text, _ = self._classify(state, image=object())
+        service_text, _ = self._classify({"image": self._png_url()})
+        assert host_text == service_text
+
+    def test_a_text_only_request_renders_as_before(self):
+        text, image = self._classify("a cat")
+        assert image is None
+        assert IMAGE_MARKER not in text
+        assert prefix_content("a cat") in text
+
+    @pytest.mark.parametrize("key", ["image", "screenshot"])
+    def test_a_state_image_beside_the_keyword_is_a_conflict(self, key):
+        with pytest.raises(SchemaError, match="two images") as caught:
+            self._classify({key: self._png_url(), "note": "x"}, image=object())
+        assert caught.value.field == f"state.{key}"
+
+    @pytest.mark.parametrize("value", ["", 5, None])
+    def test_a_non_image_value_under_an_image_key_is_content_on_both_paths(self, value):
+        state = {"image": value, "note": "x"}
+        passed = object()
+        host_text, host_image = self._classify(state, image=passed)
+        service_text, service_image = self._classify(state)
+        assert host_image is passed
+        assert service_image is None
+        assert host_text.replace(f"{IMAGE_MARKER}\n", "") == service_text

@@ -136,7 +136,7 @@ the model.
 
 ```json
 {
-  "model": "logit-classifier-0.1.0",
+  "model": "logit-classifier-0.2.0",
   "answers": {
     "department": {
       "type": "choice",
@@ -177,7 +177,7 @@ only in process.
   "questions": { "sky": { "type": "noul", "instructions": "This crop shows the night sky" } } }
 ```
 
-The image is encoded once for the entire request, so asking several questions about one
+The image is encoded once for the entire request. So asking several questions about one
 picture costs little more than asking one.
 
 A model with no vision tower rejects the request rather than ignoring the picture.
@@ -238,7 +238,8 @@ Batch composition and padding length both change the low bits of a bfloat16 forw
 and both are pure functions of the request. So the same question asked inside two
 different requests can differ slightly. Set `LOGIT_BATCH_BRANCHES=0` to score each branch
 alone, which makes a question independent of the questions sent with it and costs one
-forward pass per branch.
+forward pass per branch. `ComfyClipBackend` reads no environment variable, so it takes
+`batch_branches=False` as a keyword instead.
 
 A forward pass needs several process-global torch settings held at known values. Torch
 exposes none of them as a call argument, so the backend sets them around each pass and
@@ -286,6 +287,24 @@ the render and label contracts and returns one token id per label.
 `examples/own_backend.py` implements the entire port.
 `logit_classifier.backends.hf.HFBackend` is the transformers implementation to read
 against.
+
+`ComfyClipBackend` is the backend over a Qwen3-VL text encoder that the workflow already
+loaded, such as the one Krea 2 uses. So no second model is loaded into VRAM.
+
+```python
+from logit_classifier import Classifier, Config, NoulQuestion, SystemOneRequest
+from logit_classifier.backends.comfy_clip import ComfyClipBackend
+
+classifier = Classifier(Config(), backend=ComfyClipBackend(clip))
+question = NoulQuestion(instructions="This image visibly contains a dragon")
+request = SystemOneRequest(state="", questions={"dragon": question})
+response, _ = classifier.classify(request, image=image)
+```
+
+The `image` keyword takes an image the host already decoded, such as a ComfyUI IMAGE of
+shape `[1, H, W, 3]`. An empty state asks about the image alone. Questions share one forward
+pass of up to 4,096 tokens, and the image counts toward that limit. Any text encoder other
+than Qwen3-VL raises `UnsupportedModelError`.
 
 ## Differences From Jev
 

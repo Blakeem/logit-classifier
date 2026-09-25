@@ -32,6 +32,10 @@ class BackendContractError(LogitClassifierError, RuntimeError):
     """A backend returned rows the port does not allow."""
 
 
+class UnsupportedModelError(LogitClassifierError, ValueError):
+    """A host passed a loaded model this backend cannot read a logit row from."""
+
+
 @dataclass(frozen=True)
 class BranchLogits:
     """Raw label logits for one branch, before any calibration."""

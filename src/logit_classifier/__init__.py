@@ -9,10 +9,12 @@ with the `[hf]` extra and the HTTP service with `[service]`.
 
 from __future__ import annotations
 
+from ._version import __version__
 from .backends.base import (
     Backend,
     BackendContractError,
     BranchLogits,
+    UnsupportedModelError,
     VisionUnsupportedError,
     verify_backend,
 )
@@ -44,8 +46,6 @@ from .schema import (
     parse_request,
 )
 from .vision import ImageError
-
-__version__ = "0.1.0"
 
 # The ComfyUI socket type a node pack declares for a loaded classifier. It lives
 # here so the library and the packs cannot drift apart on the spelling.
@@ -79,6 +79,7 @@ __all__ = [
     "ScoreQuestion",
     "SystemOneRequest",
     "SystemOneResponse",
+    "UnsupportedModelError",
     "Usage",
     "VisionUnsupportedError",
     "__version__",
