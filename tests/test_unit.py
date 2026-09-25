@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -47,6 +48,7 @@ from logit_classifier.tags import (
     clean_item,
     complete_tags,
     drop_subsets,
+    drop_unfinished_tag,
     normalize_item,
     parse_candidates,
     repeated_block,
@@ -677,6 +679,14 @@ class TestCleanItem:
         ("\u2018dog\u2019", "dog"),
         ("`fox`", "fox"),
         ("  Red   Wooden\tChair.. ", "red wooden chair"),
+        ("flag of the U.S.A.", "flag of the u.s.a."),
+        ('"D.C.."', "d.c."),
+        ("- e.g.", "e.g."),
+        ("u.s.a", "u.s.a."),
+        ("u.s.a flag", "u.s.a. flag"),
+        ("a.b .", "a.b."),
+        ("w.b.yeats.", "w.b.yeats"),
+        ("vitamin C.", "vitamin c"),
     ])
     def test_cleans_one_item(self, text, item):
         assert clean_item(text) == item
@@ -718,6 +728,9 @@ class TestParseCandidates:
         candidates = parse_candidates(f"cat,, ,{seven_words},{six_words},{long_item},{edge_item}")
         assert candidates == ["cat", six_words, edge_item]
 
+    def test_two_spellings_of_an_initialism_are_one_tag(self):
+        assert parse_candidates("U.S.A., u.s.a, flag") == ["u.s.a.", "flag"]
+
     def test_removes_duplicates_keeping_first_order(self):
         assert parse_candidates("dog, cat, Dog, cat.") == ["dog", "cat"]
 
@@ -734,6 +747,15 @@ class TestParseCandidates:
         assert parse_candidates(text, max_words=2) == ["cat", "black cat", "dog", "bird"]
         assert parse_candidates(text, max_chars=3) == ["cat", "dog"]
         assert parse_candidates(text, max_candidates=2) == ["cat", "black cat"]
+
+
+class TestDropUnfinishedTag:
+    def test_keeps_the_text_through_the_last_separator(self):
+        assert drop_unfinished_tag("cat, dog; bi") == "cat, dog"
+        assert drop_unfinished_tag("cat\ndo") == "cat"
+
+    def test_a_text_with_no_separator_is_all_unfinished(self):
+        assert drop_unfinished_tag("cat") == ""
 
 
 class TestCompleteTags:
@@ -781,6 +803,27 @@ class TestSplitPrompt:
         assert split_prompt("A cat. A dog: a fox") == ["a cat", "a dog", "a fox"]
         assert split_prompt("a 2.5 liter bottle, 16:9 frame") == ["a 2.5 liter bottle", "16:9 frame"]
         assert split_prompt("version 2. next") == ["version 2", "next"]
+
+    def test_keeps_an_initialism_whole(self):
+        assert split_prompt("a flag of the U.S.A., a cowboy") == ["a flag of the u.s.a.", "a cowboy"]
+        assert split_prompt("Washington D.C. at night. Rainy street.") == [
+            "washington d.c. at night", "rainy street",
+        ]
+        assert split_prompt("e.g. clouds, 10 a.m. sunrise, u.s.a") == ["e.g. clouds", "10 a.m. sunrise", "u.s.a."]
+        # A decomposed accent is composed first, so it cannot end the initialism mid letter.
+        assert split_prompt("a.e\u0301.c") == ["a.\u00e9.c."]
+
+    def test_splits_a_long_prompt_in_linear_time(self):
+        prompt = "a.b " * 20000
+
+        started = time.perf_counter()
+        assert split_prompt(prompt) == ["a.b. " * 19999 + "a.b."]
+        assert time.perf_counter() - started < 1.0
+
+    def test_a_single_letter_or_a_word_before_a_period_still_divides(self):
+        assert split_prompt("vitamin C. Blue sky") == ["vitamin c", "blue sky"]
+        assert split_prompt("file.txt, a.bc") == ["file", "txt", "a", "bc"]
+        assert split_prompt("Mr. Smith") == ["mr", "smith"]
 
     def test_strips_edge_characters_and_collapses_whitespace(self):
         assert split_prompt("  *Big   Red\tHat_ , 'cat' , `-dog-`") == ["big red hat", "cat", "dog"]

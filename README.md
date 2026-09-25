@@ -136,7 +136,7 @@ the model.
 
 ```json
 {
-  "model": "logit-classifier-0.2.0",
+  "model": "logit-classifier-0.2.1",
   "answers": {
     "department": {
       "type": "choice",

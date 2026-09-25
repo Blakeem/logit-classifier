@@ -6,6 +6,7 @@ Stdlib only, since the ComfyUI tagging packs import it beside their own torch.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # Bounds the packed verify pass. In the Logit Tagger's tests-AB/ab_tagger.py a 42 candidate
 # image fit one pass beside a 1 MP image.
@@ -28,17 +29,36 @@ _QUOTES = "\"'`\u201c\u201d\u2018\u2019"
 
 # A period or colon between two digits is part of a number or a ratio, such as 2.5 or 16:9.
 _PROMPT_DIVIDERS = re.compile(r"[,;!?\n\r()\[\]{}|/\"<>]|(?<!\d)[.:]|[.:](?!\d)")
+# Two or more single letters joined by periods, such as u.s.a. or e.g., whose periods divide
+# nothing. The final period is optional so that "u.s.a" matches as well, and a letter after
+# it, as in "w.b.yeats", makes the run no initialism.
+_INITIALISM = r"(?<![\w.])[^\W\d_](?:\.[^\W\d_])+(?:\.(?!\w)|(?![\w.]))"
+_INITIALISMS = re.compile(_INITIALISM)
+# One scan finds both, so a period inside an initialism is never read as a divider. A divider
+# is never a letter, so the two alternatives cannot start at the same character.
+_PROMPT_PARTS = re.compile(f"(?P<initialism>{_INITIALISM})|{_PROMPT_DIVIDERS.pattern}")
 _FRAGMENT_EDGES = " '`*-_"
 
 _LEADING_FILLER = frozenset({"a", "an", "the", "and", "with", "of"})
 _WORD_BREAKS = re.compile(r"[\s-]+")
 
 
-def clean_item(text: str) -> str:
-    """Return one list item without its bullet, quotes and trailing periods, lowercased."""
-    item = _BULLET.sub("", text.strip())
+def _full_initialisms(text: str) -> str:
+    # One spelling per initialism, so "u.s.a" and "u.s.a." are one tag. NFC first, since a
+    # decomposed accent is not a word character and would end the match mid letter.
+    composed = unicodedata.normalize("NFC", text)
 
-    item = item.strip(" \t" + _QUOTES).rstrip(". \t" + _QUOTES)
+    return _INITIALISMS.sub(lambda match: match.group().rstrip(".") + ".", composed)
+
+
+def clean_item(text: str) -> str:
+    """Return one list item without its bullet, quotes and trailing periods, lowercased.
+
+    Every initialism ends in a period, such as "flag of the u.s.a.".
+    """
+    body = _BULLET.sub("", text.strip()).strip(" \t" + _QUOTES)
+    item = _full_initialisms(body.rstrip(". \t" + _QUOTES))
+
     return " ".join(item.lower().split())
 
 
@@ -64,6 +84,19 @@ def parse_candidates(text: str, *, max_candidates: int = MAX_CANDIDATES, max_wor
     return candidates
 
 
+def drop_unfinished_tag(text: str) -> str:
+    """Return the text through its last separator, or "" when it has none.
+
+    A decode that fills its token budget stops mid tag, so the text after the last separator
+    is not a whole tag.
+    """
+    separators = list(_SEPARATORS.finditer(text))
+
+    if not separators:
+        return ""
+    return text[:separators[-1].start()]
+
+
 def complete_tags(text: str) -> list[str]:
     """Return the tags a separator follows, since the text after the last one may be mid tag."""
     parts = _SEPARATORS.split(text)[:-1]
@@ -79,12 +112,29 @@ def repeated_block(tags: list[str], max_block: int = MAX_REPEAT_BLOCK) -> int:
     return 0
 
 
+def _prompt_parts(prompt: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+
+    for match in _PROMPT_PARTS.finditer(prompt):
+        if match.group("initialism"):
+            continue
+        parts.append(prompt[start:match.start()])
+        start = match.end()
+    parts.append(prompt[start:])
+    return parts
+
+
 def split_prompt(prompt: str) -> list[str]:
-    """Split a prompt into its unique lowercase fragments, in the order they were written."""
+    """Split a prompt into its unique lowercase fragments, in the order they were written.
+
+    The periods of an initialism, such as u.s.a. or d.c., divide nothing, so an initialism
+    that ends a sentence joins the next sentence's fragment. Every initialism ends in a period.
+    """
     fragments: list[str] = []
     seen: set[str] = set()
 
-    for part in _PROMPT_DIVIDERS.split(prompt):
+    for part in _prompt_parts(_full_initialisms(prompt)):
         fragment = " ".join(part.split()).strip(_FRAGMENT_EDGES).lower()
         if not any(char.isalpha() for char in fragment) or fragment in seen:
             continue
