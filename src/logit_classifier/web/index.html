@@ -216,7 +216,7 @@ function renderQuestions() {
   });
 }
 
-function esc(s) { return String(s ?? "").replace(/"/g, "&quot;"); }
+function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 
 function hint(text) { const p = document.createElement("p"); p.className = "hint"; p.textContent = text; return p; }
 
@@ -309,7 +309,7 @@ function renderAnswers(data) {
       extra = `confidence ${a.confidence.toFixed(3)}`;
     } else if (a.type === "score") {
       verdict = a.score.toFixed(2);
-      body = bars(Object.entries(a.probabilities).map(([i, p]) => [`${i} ${a.legend[i]}`, p]), null);
+      body = bars(Object.entries(a.probabilities).map(([i, p]) => [`${i} ${typeof a.legend[i] === "string" ? a.legend[i] : JSON.stringify(a.legend[i])}`, p]), null);
       extra = `confidence ${a.confidence.toFixed(3)}`;
     } else {
       verdict = a.noul >= 0.5 ? "yes" : "no";

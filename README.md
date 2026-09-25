@@ -55,8 +55,8 @@ beside your project instead, which is what the examples do.
 Config(models_dir=Path("models"))
 ```
 
-`LOGIT_MODELS_DIR` sets the same folder for every process, and `HF_HOME` moves the
-Hugging Face cache itself.
+`LOGIT_MODELS_DIR` sets the same folder for the service and for `Config.from_env()`.
+`HF_HOME` moves the Hugging Face cache itself.
 
 ## Models
 
@@ -65,8 +65,9 @@ Hugging Face cache itself.
 | reads images | yes | no |
 | better at | choice and score | noul |
 
-`Qwen3-VL-4B-Instruct` is the default. Set `LOGIT_MODEL_ID` to use the other one. Any Qwen
-chat model loads, and a model with no fitted temperature gets 2.5.
+`Qwen3-VL-4B-Instruct` is the default. Set `LOGIT_MODEL_ID` to use the other one in the
+service or through `Config.from_env()`. Any Qwen chat model loads, and a model with no
+fitted temperature gets 2.5.
 
 ## Python API
 
@@ -197,8 +198,9 @@ Each script runs on its own.
 
 ## Configuration
 
-Every setting reads from the environment at startup. `logit-classifier config` prints what
-they produce.
+The service and `logit-classifier config` read these variables at startup through
+`Config.from_env()`. Library code gets them by calling `Config.from_env()`, since `Config()`
+reads none of them. `logit-classifier config` prints what they produce.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -209,6 +211,7 @@ they produce.
 | `LOGIT_PRIOR_DEBIAS` | `1` | set to `0` to skip the label prior |
 | `LOGIT_BATCH_BRANCHES` | `1` | set to `0` for one forward pass per branch |
 | `LOGIT_SCORE_METHOD` | `joint` | set to `independent` to judge each level alone |
+| `LOGIT_PERMUTATIONS` | `1` | letterings averaged per question, each one adds branches |
 | `LOGIT_ABSTAIN` | `1` | set to `0` to drop the `none of these` label below 52 options |
 | `LOGIT_CALIBRATION_PATH` | `calibration.json` | where the service stores the running prior |
 
@@ -236,10 +239,10 @@ Nothing is sampled, so the same request returns bitwise identical logits.
 
 Batch composition and padding length both change the low bits of a bfloat16 forward pass,
 and both are pure functions of the request. So the same question asked inside two
-different requests can differ slightly. Set `LOGIT_BATCH_BRANCHES=0` to score each branch
-alone, which makes a question independent of the questions sent with it and costs one
-forward pass per branch. `ComfyClipBackend` reads no environment variable, so it takes
-`batch_branches=False` as a keyword instead.
+different requests can differ slightly. Scoring each branch alone makes a question
+independent of the questions sent with it and costs one forward pass per branch. The service
+turns it on with `LOGIT_BATCH_BRANCHES=0`. Library code passes `Config(batch_branches=False)`,
+and `ComfyClipBackend` takes `batch_branches=False` as a keyword.
 
 A forward pass needs several process-global torch settings held at known values. Torch
 exposes none of them as a call argument, so the backend sets them around each pass and
@@ -315,8 +318,8 @@ Jev is trained for calibrated probabilities. This project reads them from a gene
 so the choices agree more often than the confidences do.
 
 Jev judges a score level without its number or its neighbours. This project judges all
-levels together by default. Set `LOGIT_SCORE_METHOD=independent` for the documented
-behavior.
+levels together by default. The service follows the documented behavior with
+`LOGIT_SCORE_METHOD=independent`, and library code with `Config(score_method="independent")`.
 
 Jev publishes status codes but no error body. The error shape here is our own.
 

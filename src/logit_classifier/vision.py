@@ -30,17 +30,45 @@ class ImageError(LogitClassifierError, ValueError):
     """The state named an image that could not be read."""
 
 
-def _from_base64(value: str) -> Image:
+def _normalise(opened: Image) -> Image:
     pil_image = require("PIL.Image", "service")
+    image_ops = require("PIL.ImageOps", "service")
+    upright = image_ops.exif_transpose(opened)
+    has_alpha = upright.mode in ("RGBA", "LA", "PA") or "transparency" in upright.info
 
+    if not has_alpha:
+        return cast("Image", upright.convert("RGB"))
+    # White matches Qwen's reference qwen_vl_utils, which composites transparency onto white.
+    background = pil_image.new("RGBA", upright.size, (255, 255, 255, 255))
+    return cast("Image", pil_image.alpha_composite(background, upright.convert("RGBA")).convert("RGB"))
+
+
+def _open_rgb(source: io.BytesIO | Path, what: str) -> Image:
+    pil_image = require("PIL.Image", "service")
+    unreadable = (OSError, ValueError, pil_image.DecompressionBombError)
+    limit = pil_image.MAX_IMAGE_PIXELS
+
+    try:
+        opened = pil_image.open(source)
+    except unreadable as error:
+        raise ImageError(f"{what} is not a readable image: {error}") from error
+    # Pillow raises only above twice its limit and decodes with a warning below that. The size
+    # comes from the header, so this check runs before any pixel is decoded.
+    width, height = opened.size
+    if limit is not None and width * height > limit:
+        raise ImageError(f"{what} is {width}x{height}, above the {limit} pixel limit")
+    try:
+        return _normalise(opened)
+    except unreadable as error:
+        raise ImageError(f"{what} is not a readable image: {error}") from error
+
+
+def _from_base64(value: str) -> Image:
     try:
         raw = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
         raise ImageError(f"image is neither a readable path nor valid base64: {error}") from error
-    try:
-        return cast("Image", pil_image.open(io.BytesIO(raw)).convert("RGB"))
-    except (OSError, ValueError, pil_image.DecompressionBombError) as error:
-        raise ImageError(f"decoded bytes are not a readable image: {error}") from error
+    return _open_rgb(io.BytesIO(raw), "the decoded base64")
 
 
 def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
@@ -50,7 +78,6 @@ def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
     paths. Whether the file exists can.
     """
     path: Path | None = None
-    pil_image = require("PIL.Image", "service")
 
     if value.startswith("data:"):
         _, _, payload = value.partition(",")
@@ -76,11 +103,7 @@ def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
         return _from_base64(value)
     # UnidentifiedImageError subclasses OSError, so reading the file stays outside
     # the probe above, which would report a real file as bad base64.
-    try:
-        opened = pil_image.open(path).convert("RGB")
-    except (OSError, ValueError, pil_image.DecompressionBombError) as error:
-        raise ImageError(f"{path} is not a readable image: {error}") from error
-    return cast("Image", opened)
+    return _open_rgb(path, str(path))
 
 
 def image_key(state: Any) -> str | None:

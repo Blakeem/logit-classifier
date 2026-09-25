@@ -180,13 +180,12 @@ class Classifier:
         rounds = [questions]
 
         for seed in range(1, max(1, self.config.permutations)):
-            shuffler = random.Random(seed)
             reordered: dict[str, Question] = {}
             for qid, question in questions.items():
                 if not isinstance(question, ChoiceQuestion):
                     continue
                 names = list(question.criteria)
-                shuffler.shuffle(names)
+                random.Random(seed).shuffle(names)
                 criteria = {name: question.criteria[name] for name in names}
                 reordered[qid] = replace(question, criteria=criteria)
             if reordered:

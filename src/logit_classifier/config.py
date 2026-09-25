@@ -141,9 +141,9 @@ class Config:
 
     # "joint" scores all levels in one branch, "independent" judges each alone.
     score_method: str = "joint"
-    # Averaging over several letterings cancels the model's preference for a label
-    # position. Measured on Banking77, four letterings moved accuracy from 0.554 to
-    # 0.693. Off by default because it multiplies the branch count.
+    # Relettering varies which group each option lands in once a question splits above 52 options.
+    # On Banking77's 77 options, four letterings moved accuracy from 0.554 to 0.693. At 10 options
+    # in one branch, accuracy did not move. Off by default because it multiplies the branch count.
     permutations: int = 1
     # An escape label absorbs the mass the model would otherwise spread over wrong
     # options, so offering one raised accuracy from 0.881 to 0.887 as well as scoring

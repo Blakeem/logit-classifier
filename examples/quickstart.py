@@ -16,7 +16,8 @@ from pathlib import Path
 from logit_classifier import Classifier, Config, load_model, parse_request
 
 # Weights land beside the project instead of in the global Hugging Face cache.
-# Set LOGIT_MODELS_DIR, or HF_HOME, to keep them somewhere shared across projects.
+# Edit MODELS_DIR to share one folder across projects.
+# Neither LOGIT_MODELS_DIR nor HF_HOME reaches this script.
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 SAMPLE_TEXT = "I have been trying to connect my Stripe account for 3 days and it keeps failing."

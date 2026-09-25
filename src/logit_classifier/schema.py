@@ -25,6 +25,8 @@ _REQUEST_FIELDS = frozenset({"state", "model", "questions"})
 _QUESTION_FIELDS = frozenset({"type", "instructions", "criteria"})
 _NOUL_CRITERIA_FIELDS = frozenset({"true", "false"})
 _QUESTION_TYPES = ("choice", "score", "noul")
+# Keeps render_content's recursive json.dumps(indent=2) far below the interpreter recursion limit.
+MAX_CONTENT_DEPTH = 64
 
 
 class SchemaError(LogitClassifierError, ValueError):
@@ -178,9 +180,19 @@ def _reject_unknown(mapping: dict[str, Any], allowed: frozenset[str], where: str
 
 
 def _content(value: Any, where: str) -> JSONContent:
-    if isinstance(value, str | dict | list):
+    pending: list[tuple[Any, int]] = [(value, 1)]
+
+    if isinstance(value, str):
         return value
-    raise SchemaError(f"expected a string, object or array, got {type(value).__name__}", where)
+    if not isinstance(value, dict | list):
+        raise SchemaError(f"expected a string, object or array, got {type(value).__name__}", where)
+    while pending:
+        node, depth = pending.pop()
+        if depth > MAX_CONTENT_DEPTH:
+            raise SchemaError(f"content nests deeper than {MAX_CONTENT_DEPTH} levels", where)
+        children = node.values() if isinstance(node, dict) else node
+        pending.extend((child, depth + 1) for child in children if isinstance(child, dict | list))
+    return value
 
 
 def _optional_content(value: Any, where: str) -> JSONContent | None:
