@@ -1,6 +1,6 @@
 """The tag text tools, which moved to logit_classifier.toolkit.tags in 0.3.0.
 
-This path stays for packs built on 0.2.x. It raises no warning, since a published pack imports it.
+This path stays for code built on 0.2.x, which PyPI published. It raises no warning, so that code keeps a quiet log.
 """
 
 from __future__ import annotations

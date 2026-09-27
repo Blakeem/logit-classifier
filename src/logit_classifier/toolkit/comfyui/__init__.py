@@ -6,6 +6,7 @@ this package in a plain Python process loads none of them.
 
 from __future__ import annotations
 
+from ... import COMFY_SOCKET_TYPE
 from ...backends.comfy_clip import PACKED_TOKEN_CEILING, ComfyClipBackend
 from .classifier import comfy_classifier
 from .generate import IMAGE_SLOT, chat, clip_generate, generate_text, stop_when
@@ -21,10 +22,6 @@ from .tagger import (
     tag_picture,
     thing_scores,
 )
-
-# The ComfyUI socket type a node pack declares for a loaded classifier. It lives
-# here so the library and the packs cannot drift apart on the spelling.
-COMFY_SOCKET_TYPE = "LOGIT_CLASSIFIER"
 
 __all__ = [
     "COMFY_SOCKET_TYPE",

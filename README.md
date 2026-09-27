@@ -91,6 +91,14 @@ print(response.to_dict())
 `load_model` loads the weights through the `hf` extra and returns a `Backend`.
 `Classifier(Config())` calls it for you when you pass no backend.
 
+`classifier.nouls` asks a list of statements about one state and returns one probability
+per statement. It sends more than 256 statements as several requests.
+
+```python
+probabilities = classifier.nouls(["The message is urgent", "The message is polite"],
+                                 state="the payment failed again")
+```
+
 Loading each model yourself is what lets one script compare several. The fitted
 temperature follows the backend, so every model is scored with its own value.
 
@@ -308,6 +316,71 @@ The `image` keyword takes an image the host already decoded, such as a ComfyUI I
 shape `[1, H, W, 3]`. An empty state asks about the image alone. Questions share one forward
 pass of up to 4,096 tokens, and the image counts toward that limit. Any text encoder other
 than Qwen3-VL raises `UnsupportedModelError`.
+
+## Toolkit
+
+`logit_classifier.toolkit` holds tools built on the classifier with the settings our
+measurements found best. A project imports them to get good results without working out the
+wording, thresholds and host details itself. The toolkit uses the classifier's public API,
+and the classifier never imports the toolkit.
+
+| Package | Runs in | Holds |
+|---|---|---|
+| `logit_classifier.toolkit.tags` | any Python process | text tools for image tags and prompts |
+| `logit_classifier.toolkit.comfyui` | a ComfyUI node | a classifier over the workflow's CLIP, text generation, a progress display and an image tagger |
+
+### Tag Text Tools
+
+| Tool | Does |
+|---|---|
+| `parse_candidates` | splits a model's tag reply into clean tags with no duplicates |
+| `split_prompt` | splits an image prompt into its fragments |
+| `drop_subsets` | drops a tag whose words all appear in a longer tag |
+| `prompt_word_forms`, `in_prompt` | test whether a tag's words appear in a prompt, singular or plural |
+| `merge_candidates` | merges proposed tags with a prompt's tags under a cap |
+| `presence_question` | writes "Is there a car in this image?" with the article the thing takes |
+
+```python
+from logit_classifier.toolkit.tags import drop_subsets, parse_candidates
+
+tags = drop_subsets(parse_candidates("red car, car, wooden bench, bench"))
+# ['red car', 'wooden bench']
+```
+
+`drop_subsets(tags, rule="head-noun")` drops a tag only into a longer tag that ends in the
+same noun. So "cat" stays beside "cat ear".
+
+### ComfyUI Tools
+
+These run inside a ComfyUI node over the CLIP the workflow loaded. Each one imports comfy and
+torch only when it is called.
+
+| Tool | Does |
+|---|---|
+| `comfy_classifier` | builds a classifier over the CLIP, with errors that name the node and the Load CLIP fix |
+| `generate_text` | generates one greedy reply with the Qwen chat template, and stops early on a condition |
+| `shared_vision_encode` | runs the vision tower once per picture for every generate and classify inside the block |
+| `skip_resident_loads` | skips core's model load while the CLIP is already on the GPU |
+| `routed_progress_bars`, `send_status`, `run_outcome` | show one progress bar per run and a status line under the node |
+| `fit_picture` | downscales an image to a pixel cap |
+| `prompt_tags` | lists the physical things a prompt names |
+| `tag_picture` | tags a picture, with a prompt's things added as candidates |
+| `TagSettings` | holds every wording, budget, cap and threshold of the tagger |
+
+The tagger generates candidate tags over the CLIP and verifies each one with the classifier.
+
+```python
+from logit_classifier.toolkit.comfyui import TagSettings, comfy_classifier, fit_picture, tag_picture
+
+classifier = comfy_classifier(clip, node="My Tagger")
+picture = fit_picture(image, 1024 * 1024)
+trace = tag_picture(clip, classifier, picture, settings=TagSettings(), known={})
+tags = trace.kept
+```
+
+`known` holds the thing check's answers across a run, so each tag is asked once. The
+`TagSettings` defaults are the current measured values, and a later release may change them.
+Pass every value your output depends on to keep it fixed.
 
 ## Differences From Jev
 

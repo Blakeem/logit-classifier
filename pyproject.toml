@@ -1,7 +1,7 @@
 [project]
 name = "logit-classifier"
 dynamic = ["version"]
-description = "Local zero-shot classifier for text and images. Declares options, returns a calibrated probability for each, generates no text. Accepts the TypeSafe System One request format."
+description = "Local zero-shot classifier for text and images. Declares options and reads a calibrated probability for each from the logits. Accepts the TypeSafe System One request format, and ships a toolkit of image tag tools and ComfyUI node tools."
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]

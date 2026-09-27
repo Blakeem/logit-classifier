@@ -1401,12 +1401,14 @@ class TestPublicSurface:
             assert name in pkg.__all__, f"{name} is not exported from the package root"
             assert hasattr(pkg, name)
 
-    def test_the_comfy_socket_type_lives_on_the_comfyui_toolkit(self):
+    def test_the_comfy_socket_type_is_one_value_at_both_paths(self):
+        # 0.2.1 published it at the root, and the ComfyUI toolkit holds it beside the tools that need it.
         import logit_classifier as pkg
         from logit_classifier.toolkit import comfyui
 
-        assert not hasattr(pkg, "COMFY_SOCKET_TYPE")
-        assert comfyui.COMFY_SOCKET_TYPE == "LOGIT_CLASSIFIER"
+        assert pkg.COMFY_SOCKET_TYPE == "LOGIT_CLASSIFIER"
+        assert comfyui.COMFY_SOCKET_TYPE is pkg.COMFY_SOCKET_TYPE
+        assert "COMFY_SOCKET_TYPE" in pkg.__all__
         assert "COMFY_SOCKET_TYPE" in comfyui.__all__
 
     def test_prompt_internals_are_not_frozen_into_the_root(self):
