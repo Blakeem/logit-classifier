@@ -109,15 +109,15 @@ class TagSettings:
     # The crop wording "This crop visibly contains {f}" reached AUC 0.963 in this repo's tests-AB/ab_multi_label.py.
     # "Is there {TAG} in this image?" removed 34 correct tile tags per 4 wrong ones (ab_tags_bench.py).
     verify_statement: str = "This image visibly contains {TAG}"
-    # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 3 to 4 correct ones on renders, photos and tiles, and
-    # 0.9999 cost about 50 correct tile tags per further one (ab_tagger_score.py --replay, ab_tags_bench.py).
+    # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 2.6 to 4.0 correct ones on renders, photos and tiles,
+    # and 0.9999 cost about 50 correct tile tags per further one (ab_tagger_score.py --replay, ab_tags_bench.py).
     verify_threshold: float = 0.999
     # A near name passes 0.9, and 0.9999 cut wrong tags per tile from 0.92 to 0.29 (ContextAnchoredTileRefine
     # tests-AB/tags-bench-log.md).
     prompt_only_threshold: float = 0.9999
 
     # The "head-noun" rule keeps "cat" beside "cat ear", and also "stone" beside "stone walls" and "castle" beside
-    # "stone castle tower". On fp8 tiles it added 0.03 wrong tags per tile (ab_tags_bench.py).
+    # "stone castle tower". On fp8 tiles it added 0.03 wrong or vague tags per tile (ab_tags_bench.py).
     subsets_rule: str = "words"
     order: str = "score"
 
