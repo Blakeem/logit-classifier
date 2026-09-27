@@ -88,8 +88,8 @@ class TagSettings:
     translate_instruction: str = "Translate this image prompt into English. Output only the translation.\n\n{PROMPT}"
     translate_max_tokens: int = 512
 
-    # No verify threshold separates scene, lighting, color and quality words from things. This wording beat five
-    # others at AUC 0.839 on 2,627 judged tags of both packs on fp8.
+    # No verify threshold separates scene, lighting, color and quality words from things. On fp8 this wording read
+    # AUC 0.839 and five others 0.546 to 0.846 (the Logit Tagger's tests-AB/ab_thing_wordings.py).
     thing_question: str = 'What does the image tag "{TAG}" name'
     thing_criteria: tuple[tuple[str, str], ...] = (
         ("thing", "something that could be pointed at in a picture: an object, a person, a group of people "
