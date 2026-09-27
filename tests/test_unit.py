@@ -1949,8 +1949,8 @@ class FakeClip:
 
 @pytest.fixture
 def fake_comfy(monkeypatch):
-    """comfy.model_management and comfy.ops, down to the three calls the packed pass makes."""
-    state = SimpleNamespace(bf16=False, devices=[], quantized=[])
+    """comfy.model_management and comfy.ops, down to the calls and the loaded list the packed pass reads."""
+    state = SimpleNamespace(bf16=False, devices=[], quantized=[], loaded=[])
     comfy = ModuleType("comfy")
     management = ModuleType("comfy.model_management")
     ops = ModuleType("comfy.ops")
@@ -1967,6 +1967,7 @@ def fake_comfy(monkeypatch):
 
     management.should_use_bf16 = lambda device=None: state.bf16
     management.cuda_device_context = cuda_device_context
+    management.current_loaded_models = state.loaded
     ops.use_quantized_matmul = use_quantized_matmul
     comfy.model_management = management
     comfy.ops = ops
@@ -2411,6 +2412,177 @@ class TestComfyPackedScore:
             assert torch.backends.cudnn.deterministic is False
         finally:
             torch.backends.cudnn.deterministic = saved
+
+    def _make_resident(self, clip, fake_comfy):
+        # The state core's own load_model leaves a CLIP in, at the head of the loaded list.
+        clip.patcher = SimpleNamespace(
+            load_device="cpu",
+            patches_uuid="patches",
+            model=SimpleNamespace(device="cpu", current_weight_patches_uuid="patches", model_loaded_weight_memory=1),
+        )
+        fake_comfy.loaded[:] = [SimpleNamespace(model=clip.patcher)]
+
+    def _loads(self, clip):
+        return [event for event in clip.cond_stage_model.events if isinstance(event, tuple)]
+
+    def _classify_twice(self, backend):
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        request = parse_request({"state": "a cat", "questions": {"q": {"type": "noul"}, "r": {"type": "noul"}}})
+        classifier = Classifier(Config(), backend)
+        return [classifier.classify(request) for _ in range(2)]
+
+    def test_a_resident_clip_is_not_reloaded_and_scores_the_same(self, fake_comfy):
+        _, loaded_clip, loaded_backend = self._setup()
+        expected = self._classify_twice(loaded_backend)
+        _, clip, backend = self._setup()
+        self._make_resident(clip, fake_comfy)
+
+        assert self._classify_twice(backend) == expected
+        assert len(self._loads(loaded_clip)) == 2
+        assert self._loads(clip) == []
+
+    @pytest.mark.parametrize(
+        "break_residency",
+        [
+            lambda clip, loaded: loaded.insert(0, SimpleNamespace(model=SimpleNamespace())),
+            lambda clip, loaded: setattr(clip.patcher.model, "device", "offload"),
+            lambda clip, loaded: setattr(clip.patcher, "patches_uuid", "lora"),
+            lambda clip, loaded: setattr(clip.patcher.model, "model_loaded_weight_memory", 0),
+            lambda clip, loaded: loaded.clear(),
+        ],
+        ids=["another-model-at-head", "device-differs", "patch-uuid-differs", "no-loaded-memory", "empty-list"],
+    )
+    def test_each_failed_residency_condition_loads(self, fake_comfy, break_residency):
+        from logit_classifier.backends.comfy_clip import _resident
+
+        _, clip, backend = self._setup()
+        self._make_resident(clip, fake_comfy)
+        assert _resident(clip) is True
+        break_residency(clip, fake_comfy.loaded)
+        backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+
+        assert _resident(clip) is False
+        assert len(self._loads(clip)) == 1
+
+    def test_a_core_without_the_loaded_list_reads_as_not_resident(self, fake_comfy, monkeypatch):
+        from logit_classifier.backends.comfy_clip import _resident
+
+        _, clip, backend = self._setup()
+        self._make_resident(clip, fake_comfy)
+        monkeypatch.delattr(sys.modules["comfy.model_management"], "current_loaded_models")
+        backend.score(backend.encode("pq"), [backend.encode("ab")], [2])
+
+        assert _resident(clip) is False
+        assert len(self._loads(clip)) == 1
+
+
+class EmbedCountingTransformer(FakeQwenTransformer):
+    """A transformer carrying core's preprocess_embed, which counts the vision tower passes."""
+
+    def __init__(self):
+        super().__init__()
+        self.encodes = []
+
+    def preprocess_embed(self, embed, device):
+        import torch
+
+        self.encodes.append((embed.get("type"), device, torch.backends.cudnn.deterministic))
+        return object(), {"type": embed.get("type")}
+
+
+class TestSharedVisionEncode:
+    """One vision tower pass per picture tensor across a generate and a classify."""
+
+    def test_the_same_tensor_is_encoded_once_inside_the_window(self, fake_comfy):
+        torch = pytest.importorskip("torch")
+        from logit_classifier.backends.comfy_clip import shared_vision_encode
+
+        transformer = EmbedCountingTransformer()
+        data = torch.zeros(1, 4, 4, 3)
+        saved = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = False
+        try:
+            with shared_vision_encode(FakeClip(transformer=transformer)):
+                first = transformer.preprocess_embed({"type": "image", "data": data}, device="cpu")
+                second = transformer.preprocess_embed({"type": "image", "data": data}, device="cpu")
+        finally:
+            torch.backends.cudnn.deterministic = saved
+
+        assert first is second
+        assert transformer.encodes == [("image", "cpu", True)]
+
+    def test_another_tensor_or_device_encodes_again(self, fake_comfy):
+        torch = pytest.importorskip("torch")
+        from logit_classifier.backends.comfy_clip import shared_vision_encode
+
+        transformer = EmbedCountingTransformer()
+        data = torch.zeros(1, 4, 4, 3)
+        other = torch.zeros(1, 4, 4, 3)
+        with shared_vision_encode(FakeClip(transformer=transformer)):
+            transformer.preprocess_embed({"type": "image", "data": data}, device="cpu")
+            transformer.preprocess_embed({"type": "image", "data": other}, device="cpu")
+            transformer.preprocess_embed({"type": "image", "data": data}, device="cuda:0")
+
+        assert [device for _, device, _ in transformer.encodes] == ["cpu", "cpu", "cuda:0"]
+
+    @pytest.mark.parametrize(
+        "embed",
+        [{"type": "text", "data": "a cat"}, {"type": "image", "data": [[0.0]]}],
+        ids=["non-image", "image-not-a-tensor"],
+    )
+    def test_any_other_embed_always_reaches_the_original(self, fake_comfy, embed):
+        pytest.importorskip("torch")
+        from logit_classifier.backends.comfy_clip import shared_vision_encode
+
+        transformer = EmbedCountingTransformer()
+        with shared_vision_encode(FakeClip(transformer=transformer)):
+            transformer.preprocess_embed(embed, device="cpu")
+            transformer.preprocess_embed(embed, device="cpu")
+
+        assert len(transformer.encodes) == 2
+
+    @pytest.mark.parametrize("shadowed", [True, False], ids=["was-shadowed", "not-shadowed"])
+    @pytest.mark.parametrize("raises", [False, True], ids=["normal-exit", "exception"])
+    def test_the_instance_is_restored_and_the_cache_dropped(self, fake_comfy, shadowed, raises):
+        torch = pytest.importorskip("torch")
+        import gc
+        import weakref
+
+        from logit_classifier.backends.comfy_clip import shared_vision_encode
+
+        transformer = EmbedCountingTransformer()
+        instance_encode = transformer.preprocess_embed
+        if shadowed:
+            transformer.preprocess_embed = instance_encode
+        data = torch.zeros(1, 4, 4, 3)
+        released = weakref.ref(data)
+
+        with contextlib.suppress(RuntimeError), shared_vision_encode(FakeClip(transformer=transformer)):
+            # A caller may keep the wrapper past the block, so only clearing the cache frees the tensor.
+            wrapper = transformer.preprocess_embed
+            wrapper({"type": "image", "data": data}, device="cpu")
+            if raises:
+                raise RuntimeError("the body blew up")
+        del data
+        gc.collect()
+
+        assert released() is None
+        assert wrapper is not instance_encode
+        if shadowed:
+            assert vars(transformer)["preprocess_embed"] is instance_encode
+        else:
+            assert "preprocess_embed" not in vars(transformer)
+
+    def test_a_transformer_without_preprocess_embed_passes_through(self, fake_comfy):
+        pytest.importorskip("torch")
+        from logit_classifier.backends.comfy_clip import shared_vision_encode
+
+        transformer = FakeQwenTransformer()
+        with shared_vision_encode(FakeClip(transformer=transformer)):
+            assert "preprocess_embed" not in vars(transformer)
+        assert "preprocess_embed" not in vars(transformer)
 
 
 class ImageRecordingBackend(StubBackend):

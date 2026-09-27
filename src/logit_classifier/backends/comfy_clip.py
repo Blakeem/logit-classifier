@@ -9,6 +9,8 @@ already holds both.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 from ..config import canonical_model_id
@@ -99,6 +101,29 @@ def _check_image(image: Any) -> None:
         )
     if len(shape) != 4 or shape[0] != 1 or shape[3] != 3:
         raise ImageError(f"a ComfyUI IMAGE of shape [1, H, W, 3] is required, got shape {shape}")
+
+
+def _resident(clip: Any) -> bool:
+    """Whether the CLIP sits where its own load_model call leaves it, so loading again is a no-op.
+
+    Core's load_models_gpu has no fast path for a loaded model and costs about 0.1 s per call.
+    """
+    try:
+        import comfy.model_management as model_management
+
+        patcher = clip.patcher
+        loaded = model_management.current_loaded_models
+        # Another model's load always inserts at the head, and a changed LoRA patch set or an
+        # offloaded CLIP must reload.
+        return bool(
+            loaded
+            and loaded[0].model is patcher
+            and patcher.model.device == patcher.load_device
+            and patcher.model.current_weight_patches_uuid == patcher.patches_uuid
+            and patcher.model.model_loaded_weight_memory > 0
+        )
+    except (ImportError, AttributeError):
+        return False
 
 
 def _pack_passes(prefix_length: int, suffix_lengths: list[int], batch_branches: bool) -> list[list[int]]:
@@ -284,7 +309,8 @@ class ComfyClipBackend:
             prefix_tokens[vision["pad_index"]] = {"type": "image", "data": vision["image"], "original_type": "image"}
         with _determinism(), torch.inference_mode():
             encoder.reset_clip_options()
-            clip.load_model({self._tokens_key: [prefix_tokens]})
+            if not _resident(clip):
+                clip.load_model({self._tokens_key: [prefix_tokens]})
             device = clip.patcher.load_device
             encoder.set_clip_options({"layer": None, "execution_device": device})
             # BaseGenerate.generate picks its execution dtype this way, at llama.py:1115-1120.
@@ -412,3 +438,44 @@ class ComfyClipBackend:
         full_norm = torch.logsumexp(row, dim=0)
         mass = float(torch.exp(torch.logsumexp(selected, dim=0) - full_norm))
         return BranchLogits(z=selected.double().cpu().numpy(), candidate_mass=mass)
+
+
+@contextmanager
+def shared_vision_encode(clip: Any) -> Iterator[None]:
+    """Run the vision tower once per picture tensor for the duration, shared by generate and classify.
+
+    Each encode runs inside the determinism window, where classify always ran it, so its
+    scores are unchanged. A transformer without core's preprocess_embed passes through.
+    """
+    import torch
+
+    transformer = _clip_parts(clip)[1]
+    original = getattr(transformer, "preprocess_embed", None)
+    shadowed = "preprocess_embed" in vars(transformer)
+    previous = vars(transformer).get("preprocess_embed")
+    cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+
+    if not callable(original):
+        yield
+        return
+
+    def preprocess_embed(embed: Any, device: Any) -> Any:
+        data = embed.get("data")
+        if embed.get("type") != "image" or not torch.is_tensor(data):
+            return original(embed, device=device)
+        # The tensor is held beside its result, so its id cannot be reused while cached.
+        key = (id(data), tuple(data.shape), data.dtype, str(device))
+        if key not in cache:
+            with _determinism():
+                cache[key] = (data, original(embed, device=device))
+        return cache[key][1]
+
+    transformer.preprocess_embed = preprocess_embed
+    try:
+        yield
+    finally:
+        cache.clear()
+        if shadowed:
+            transformer.preprocess_embed = previous
+        else:
+            del transformer.preprocess_embed
