@@ -136,8 +136,8 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 # transformers publishes no complete stubs, and accelerate none at all. torch is
 # listed so the type gate still runs where the hf extra is absent, such as CI.
-# The ComfyUI host supplies comfy, and neither this venv nor CI has it.
-module = ["transformers.*", "accelerate.*", "torch.*", "comfy.*"]
+# The ComfyUI host supplies comfy, server and comfy_execution, and neither this venv nor CI has them.
+module = ["transformers.*", "accelerate.*", "torch.*", "comfy.*", "server", "server.*", "comfy_execution.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

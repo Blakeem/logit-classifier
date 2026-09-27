@@ -9,8 +9,6 @@ already holds both.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 from ..config import canonical_model_id
@@ -438,44 +436,3 @@ class ComfyClipBackend:
         full_norm = torch.logsumexp(row, dim=0)
         mass = float(torch.exp(torch.logsumexp(selected, dim=0) - full_norm))
         return BranchLogits(z=selected.double().cpu().numpy(), candidate_mass=mass)
-
-
-@contextmanager
-def shared_vision_encode(clip: Any) -> Iterator[None]:
-    """Run the vision tower once per picture tensor for the duration, shared by generate and classify.
-
-    Each encode runs inside the determinism window, where classify always ran it, so its
-    scores are unchanged. A transformer without core's preprocess_embed passes through.
-    """
-    import torch
-
-    transformer = _clip_parts(clip)[1]
-    original = getattr(transformer, "preprocess_embed", None)
-    shadowed = "preprocess_embed" in vars(transformer)
-    previous = vars(transformer).get("preprocess_embed")
-    cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
-
-    if not callable(original):
-        yield
-        return
-
-    def preprocess_embed(embed: Any, device: Any) -> Any:
-        data = embed.get("data")
-        if embed.get("type") != "image" or not torch.is_tensor(data):
-            return original(embed, device=device)
-        # The tensor is held beside its result, so its id cannot be reused while cached.
-        key = (id(data), tuple(data.shape), data.dtype, str(device))
-        if key not in cache:
-            with _determinism():
-                cache[key] = (data, original(embed, device=device))
-        return cache[key][1]
-
-    transformer.preprocess_embed = preprocess_embed
-    try:
-        yield
-    finally:
-        cache.clear()
-        if shadowed:
-            transformer.preprocess_embed = previous
-        else:
-            del transformer.preprocess_embed

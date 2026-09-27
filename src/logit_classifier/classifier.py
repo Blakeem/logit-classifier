@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -11,7 +12,7 @@ import numpy as np
 
 from .backends.base import Backend, BackendContractError, BranchLogits
 from .calibrate import PriorStore
-from .config import ANSWER_PREFILL, Config, fitted_temperature
+from .config import ANSWER_PREFILL, JEV_MAX_QUESTIONS, Config, fitted_temperature
 from .deps import MissingDependencyError
 from .prompt import (
     PROMPT_VERSION,
@@ -25,6 +26,7 @@ from .schema import (
     Answer,
     ChoiceAnswer,
     ChoiceQuestion,
+    JSONContent,
     NoulAnswer,
     NoulQuestion,
     Question,
@@ -278,6 +280,28 @@ class Classifier:
             model=self.config.served_model_id, answers=answers, usage=usage
         )
         return response, diagnostics
+
+    def nouls(self, statements: Sequence[str], *, image: Any = None, state: JSONContent = "") -> list[float]:
+        """Return each statement's noul about the state, in statement order.
+
+        The statements are split into requests of JEV_MAX_QUESTIONS, one classify call each, and no
+        statements make no request. An empty state with an image is the image-only state.
+        """
+        keys = [f"s{index}" for index in range(len(statements))]
+        questions: dict[str, Question] = {}
+        nouls: list[float] = []
+
+        for start in range(0, len(statements), JEV_MAX_QUESTIONS):
+            window = slice(start, start + JEV_MAX_QUESTIONS)
+            questions = {key: NoulQuestion(instructions=statement)
+                         for key, statement in zip(keys[window], statements[window], strict=True)}
+            response, _diagnostics = self.classify(SystemOneRequest(state=state, questions=questions), image=image)
+            for key in questions:
+                answer = response.answers[key]
+                if not isinstance(answer, NoulAnswer):
+                    raise TypeError(f"question {key} got a {answer.type} answer, not a noul")
+                nouls.append(answer.noul)
+        return nouls
 
     def _round_answers(self, questions: dict[str, Question], branches: list[Branch],
                        probabilities: list[np.ndarray]) -> dict[str, Answer]:

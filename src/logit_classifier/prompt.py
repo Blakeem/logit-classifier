@@ -52,7 +52,7 @@ class Branch:
     suffix_text: str
 
 
-def _inert(text: str) -> str:
+def inert(text: str) -> str:
     # The backends' tokenizers read a <|...|> spelling in plain text as a control token, so
     # client text could otherwise forge a chat turn or a second image pad.
     return text.replace("<|", "<\u200b|")
@@ -67,7 +67,7 @@ def _option_lines(entries: list[tuple[str, str]]) -> str:
 
 
 def _question_block(prompt_line: str, entries: list[tuple[str, str]]) -> str:
-    return _inert(f"{prompt_line}\nOptions:\n{_option_lines(entries)}")
+    return inert(f"{prompt_line}\nOptions:\n{_option_lines(entries)}")
 
 
 def _choice_branches(qid: str, question: ChoiceQuestion, plan: BranchPlan,
@@ -152,7 +152,7 @@ def build_branches(questions: dict[str, Question], score_method: str = "joint",
 def prefix_content(state: Any, has_image: bool = False) -> str:
     """Build the user-message body every branch shares, image marker included."""
     marker = f"{IMAGE_MARKER}\n" if has_image else ""
-    return f"Context:\n{marker}{_inert(render_content(state))}\n\n"
+    return f"Context:\n{marker}{inert(render_content(state))}\n\n"
 
 
 def branch_content(state: Any, branch: Branch, has_image: bool = False) -> str:

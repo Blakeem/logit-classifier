@@ -10,7 +10,6 @@ import json
 import re
 import subprocess
 import sys
-import time
 import warnings
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -43,17 +42,6 @@ from logit_classifier.scoring import (
     normalise_levels,
     restricted_softmax,
     score_confidence,
-)
-from logit_classifier.tags import (
-    MAX_CANDIDATES,
-    clean_item,
-    complete_tags,
-    drop_subsets,
-    drop_unfinished_tag,
-    normalize_item,
-    parse_candidates,
-    repeated_block,
-    split_prompt,
 )
 from logit_classifier.vision import ImageError, extract_image
 
@@ -685,6 +673,72 @@ class TestPriorGate:
         assert orders_alone == orders_paired
 
 
+class NumberedStatementBackend(StubBackend):
+    """Scores each statement "fact <n>" with a true logit that rises with n, and records every request."""
+
+    def __init__(self):
+        self.prefixes: list[str] = []
+        self.images: list[object] = []
+        self.request_sizes: list[int] = []
+
+    def encode_prefix(self, text, image=None):
+        self.prefixes.append(text)
+        self.images.append(image)
+        return self.encode(text), {}
+
+    def score(self, prefix_ids, suffix_ids, label_counts, vision=None):
+        from logit_classifier.backends.base import BranchLogits
+
+        self.request_sizes.append(len(label_counts))
+        numbers = [int(re.search(rb"fact (\d+)\b", bytes(ids)).group(1)) for ids in suffix_ids]
+        return [BranchLogits(z=np.array([number / 100, 0.0]), candidate_mass=1.0) for number in numbers]
+
+
+class TestNouls:
+    def _classifier(self, tmp_path, backend):
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        return Classifier(Config(use_prior_debias=False, calibration_path=tmp_path / "c.json"), backend)
+
+    def test_keeps_the_statement_order(self, tmp_path):
+        backend = NumberedStatementBackend()
+
+        nouls = self._classifier(tmp_path, backend).nouls(["fact 30", "fact 10", "fact 20"], state="a room")
+        assert nouls[1] < nouls[2] < nouls[0]
+        assert backend.request_sizes == [3]
+        assert "a room" in backend.prefixes[0]
+
+    def test_no_statements_make_no_request(self, tmp_path):
+        backend = NumberedStatementBackend()
+
+        assert self._classifier(tmp_path, backend).nouls([]) == []
+        assert backend.prefixes == []
+        assert backend.request_sizes == []
+
+    def test_splits_the_statements_into_requests_of_the_question_cap(self, tmp_path):
+        from logit_classifier.config import JEV_MAX_QUESTIONS
+
+        backend = NumberedStatementBackend()
+
+        nouls = self._classifier(tmp_path, backend).nouls([f"fact {number}" for number in range(300)])
+        assert JEV_MAX_QUESTIONS == 256
+        assert backend.request_sizes == [256, 44]
+        assert len(nouls) == 300
+        assert nouls == sorted(nouls)
+        assert len(set(nouls)) == 300
+
+    def test_an_empty_state_with_an_image_is_the_image_only_state(self, tmp_path):
+        from logit_classifier.vision import IMAGE_ONLY_STATE
+
+        backend = NumberedStatementBackend()
+        image = object()
+
+        self._classifier(tmp_path, backend).nouls(["fact 1"], image=image)
+        assert backend.images == [image]
+        assert IMAGE_ONLY_STATE in backend.prefixes[0]
+
+
 class TestLetteringMerge:
     def test_rounds_are_averaged_by_option_name_not_by_key_order(self, tmp_path):
         from logit_classifier.classifier import Classifier
@@ -822,236 +876,64 @@ class TestSchemaErrors:
         ]
 
 
-class TestCleanItem:
-    @pytest.mark.parametrize(("text", "item"), [
-        ("- cat", "cat"),
-        ("* dog", "dog"),
-        ("\u2022 bird", "bird"),
-        ("1. fish", "fish"),
-        ("2) frog", "frog"),
-        ("3.", ""),
-        ("2.5 liter bottle", "2.5 liter bottle"),
-        ("3d render", "3d render"),
-        ('"red hat."', "red hat"),
-        ("\u201cCat\u201d", "cat"),
-        ("\u2018dog\u2019", "dog"),
-        ("`fox`", "fox"),
-        ("  Red   Wooden\tChair.. ", "red wooden chair"),
-        ("flag of the U.S.A.", "flag of the u.s.a."),
-        ('"D.C.."', "d.c."),
-        ("- e.g.", "e.g."),
-        ("u.s.a", "u.s.a."),
-        ("u.s.a flag", "u.s.a. flag"),
-        ("a.b .", "a.b."),
-        ("w.b.yeats.", "w.b.yeats"),
-        ("vitamin C.", "vitamin c"),
-    ])
-    def test_cleans_one_item(self, text, item):
-        assert clean_item(text) == item
+def _imported_names(path: Path, source: Path) -> list[str]:
+    """Return every name the file imports, with relative imports resolved against its package."""
+    package_parts = ["logit_classifier", *path.relative_to(source).parent.parts]
+    names: list[str] = []
+
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base_parts = package_parts[:len(package_parts) - node.level + 1] if node.level else []
+            module = ".".join([*base_parts, *([node.module] if node.module else [])])
+            names.extend(f"{module}.{alias.name}" for alias in node.names)
+    return names
 
 
-class TestParseCandidates:
-    def test_splits_on_commas_semicolons_and_newlines(self):
-        assert parse_candidates("cat, dog; bird\nfish") == ["cat", "dog", "bird", "fish"]
-
-    def test_strips_list_bullets(self):
-        text = "- cat\n* dog\n\u2022 bird\n1. fish\n2) frog"
-
-        assert parse_candidates(text) == ["cat", "dog", "bird", "fish", "frog"]
-
-    def test_keeps_a_number_that_is_not_a_bullet(self):
-        assert parse_candidates("3d render, 2 cats") == ["3d render", "2 cats"]
-
-    def test_strips_quotes_and_trailing_periods(self):
-        assert parse_candidates('"cat", \'dog\', bird.') == ["cat", "dog", "bird"]
-        assert parse_candidates('"red hat."') == ["red hat"]
-
-    def test_drops_a_think_block(self):
-        assert parse_candidates("<think>\nmaybe a cat, a dog\n</think>\n\nfox, tree") == ["fox", "tree"]
-        assert parse_candidates("<think>still thinking, cat") == []
-
-    def test_drops_a_leading_assistant_line(self):
-        assert parse_candidates("assistant\nfox, tree") == ["fox", "tree"]
-        assert parse_candidates("fox\nassistant") == ["fox", "assistant"]
-
-    def test_lowercases_and_collapses_whitespace(self):
-        assert parse_candidates("Red   Wooden\tChair") == ["red wooden chair"]
-
-    def test_drops_empty_and_long_items(self):
-        seven_words = "one two three four five six seven"
-        six_words = "one two three four five six"
-        long_item = "a" * 61
-        edge_item = "a" * 60
-
-        candidates = parse_candidates(f"cat,, ,{seven_words},{six_words},{long_item},{edge_item}")
-        assert candidates == ["cat", six_words, edge_item]
-
-    def test_two_spellings_of_an_initialism_are_one_tag(self):
-        assert parse_candidates("U.S.A., u.s.a, flag") == ["u.s.a.", "flag"]
-
-    def test_removes_duplicates_keeping_first_order(self):
-        assert parse_candidates("dog, cat, Dog, cat.") == ["dog", "cat"]
-
-    def test_caps_the_candidate_count(self):
-        text = ", ".join(f"tag {index}" for index in range(MAX_CANDIDATES + 5))
-
-        candidates = parse_candidates(text)
-        assert len(candidates) == MAX_CANDIDATES
-        assert candidates[-1] == f"tag {MAX_CANDIDATES - 1}"
-
-    def test_takes_its_limits_as_arguments(self):
-        text = "cat, black cat, big black cat, dog, bird"
-
-        assert parse_candidates(text, max_words=2) == ["cat", "black cat", "dog", "bird"]
-        assert parse_candidates(text, max_chars=3) == ["cat", "dog"]
-        assert parse_candidates(text, max_candidates=2) == ["cat", "black cat"]
-
-
-class TestDropUnfinishedTag:
-    def test_keeps_the_text_through_the_last_separator(self):
-        assert drop_unfinished_tag("cat, dog; bi") == "cat, dog"
-        assert drop_unfinished_tag("cat\ndo") == "cat"
-
-    def test_a_text_with_no_separator_is_all_unfinished(self):
-        assert drop_unfinished_tag("cat") == ""
-
-
-class TestCompleteTags:
-    def test_skips_the_tag_still_being_written(self):
-        assert complete_tags("man, man") == ["man"]
-        assert complete_tags("man, man,") == ["man", "man"]
-
-    def test_cleans_and_drops_empty_tags(self):
-        assert complete_tags("- Cat,, \n\u201cDog\u201d;fox") == ["cat", "dog"]
-
-
-class TestRepeatedBlock:
-    @pytest.mark.parametrize(("tags", "size"), [
-        (["man", "man"], 1),
-        (["man", "man with hat"], 0),
-        (["man", "manatee"], 0),
-        (["sky", "a", "b", "c", "a", "b", "c"], 3),
-        (["a", "b", "c", "d", "a", "b", "c", "d"], 4),
-        (["a", "b", "c", "d", "e", "a", "b", "c", "d", "e"], 0),
-        (["a", "b", "a"], 0),
-        ([], 0),
-    ])
-    def test_finds_only_a_back_to_back_block(self, tags, size):
-        assert repeated_block(tags) == size
-
-    def test_takes_the_largest_block_as_an_argument(self):
-        tags = ["a", "b", "c", "d", "e", "a", "b", "c", "d", "e"]
-
-        assert repeated_block(tags, max_block=5) == 5
-        assert repeated_block(["a", "b", "a", "b"], max_block=1) == 0
-
-    def test_returns_the_smallest_block(self):
-        assert repeated_block(["a", "a", "a", "a"]) == 1
-
-
-class TestSplitPrompt:
-    def test_splits_on_every_divider(self):
-        prompt = 'cat, dog; fox! owl? (hat) [cup] {pen} bee|ant/elk "yak" <emu>\nrat\rbat'
-
-        assert split_prompt(prompt) == [
-            "cat", "dog", "fox", "owl", "hat", "cup", "pen", "bee", "ant", "elk", "yak", "emu", "rat", "bat",
-        ]
-
-    def test_splits_on_a_period_or_colon_outside_a_number(self):
-        assert split_prompt("A cat. A dog: a fox") == ["a cat", "a dog", "a fox"]
-        assert split_prompt("a 2.5 liter bottle, 16:9 frame") == ["a 2.5 liter bottle", "16:9 frame"]
-        assert split_prompt("version 2. next") == ["version 2", "next"]
-
-    def test_keeps_an_initialism_whole(self):
-        assert split_prompt("a flag of the U.S.A., a cowboy") == ["a flag of the u.s.a.", "a cowboy"]
-        assert split_prompt("Washington D.C. at night. Rainy street.") == [
-            "washington d.c. at night", "rainy street",
-        ]
-        assert split_prompt("e.g. clouds, 10 a.m. sunrise, u.s.a") == ["e.g. clouds", "10 a.m. sunrise", "u.s.a."]
-        # A decomposed accent is composed first, so it cannot end the initialism mid letter.
-        assert split_prompt("a.e\u0301.c") == ["a.\u00e9.c."]
-
-    def test_splits_a_long_prompt_in_linear_time(self):
-        prompt = "a.b " * 20000
-
-        started = time.perf_counter()
-        assert split_prompt(prompt) == ["a.b. " * 19999 + "a.b."]
-        assert time.perf_counter() - started < 1.0
-
-    def test_a_single_letter_or_a_word_before_a_period_still_divides(self):
-        assert split_prompt("vitamin C. Blue sky") == ["vitamin c", "blue sky"]
-        assert split_prompt("file.txt, a.bc") == ["file", "txt", "a", "bc"]
-        assert split_prompt("Mr. Smith") == ["mr", "smith"]
-
-    def test_strips_edge_characters_and_collapses_whitespace(self):
-        assert split_prompt("  *Big   Red\tHat_ , 'cat' , `-dog-`") == ["big red hat", "cat", "dog"]
-
-    def test_drops_a_part_with_no_letter_and_a_repeat(self):
-        assert split_prompt("cat, 42, --, Cat, 3.5, dog") == ["cat", "dog"]
-
-    def test_counts_a_non_ascii_letter(self):
-        assert split_prompt("caf\u00e9, 12") == ["caf\u00e9"]
-
-    def test_empty_prompt(self):
-        assert split_prompt("") == []
-
-
-class TestNormalizeItem:
-    @pytest.mark.parametrize(("text", "item"), [
-        ("the old man", "old man"),
-        ("and the man", "man"),
-        ("the", "the"),
-        ("a an", "an"),
-        ("with a hat of wool", "hat of wool"),
-        ("- The Old Man.", "old man"),
-        ("theater", "theater"),
-        ("", ""),
-    ])
-    def test_removes_leading_filler_words(self, text, item):
-        assert normalize_item(text) == item
-
-
-class TestDropSubsets:
-    def test_drops_an_item_another_item_holds(self):
-        assert drop_subsets(["herbs", "hanging dried herbs"]) == ["hanging dried herbs"]
-
-    def test_keeps_the_first_of_equal_word_sets(self):
-        assert drop_subsets(["red car", "car red"]) == ["red car"]
-
-    def test_splits_words_on_hyphens(self):
-        assert drop_subsets(["tomato", "sun-dried tomato", "dried sun"]) == ["sun-dried tomato", "dried sun"]
-
-    def test_folds_a_hyphenated_superset_with_the_same_head(self):
-        assert drop_subsets(["tomato", "sun-dried tomato"]) == ["sun-dried tomato"]
-
-    def test_keeps_a_whole_beside_its_named_parts(self):
-        assert drop_subsets(["cat", "cat ear", "cat paw"]) == ["cat", "cat ear", "cat paw"]
-
-    def test_drops_only_into_a_superset_with_the_same_head(self):
-        assert drop_subsets(["sword", "sword hilt", "steel sword"]) == ["sword hilt", "steel sword"]
-
-    def test_keeps_a_whole_beside_a_longer_part(self):
-        assert drop_subsets(["table", "wooden table leg"]) == ["table", "wooden table leg"]
-
-    def test_keeps_order_and_unrelated_items(self):
-        assert drop_subsets(["sky", "red car", "car", "tree", "old tree"]) == ["sky", "red car", "old tree"]
-
-    def test_empty_list(self):
-        assert drop_subsets([]) == []
+def _imports_the_toolkit(path: Path, source: Path) -> bool:
+    return any(name == "logit_classifier.toolkit" or name.startswith("logit_classifier.toolkit.")
+               for name in _imported_names(path, source))
 
 
 class TestCoreIsolation:
-    def test_importing_the_package_loads_no_host(self):
+    SOURCE = Path(__file__).resolve().parents[1] / "src" / "logit_classifier"
+
+    @pytest.mark.parametrize("tags_module", ["logit_classifier.tags", "logit_classifier.toolkit.tags"])
+    def test_importing_the_package_loads_no_host(self, tags_module):
         # Prime directive 4. A ComfyUI pack imports this package beside ComfyUI's own
         # pinned CUDA build, so a stray top-level torch import would be a hard break.
         # A subprocess is the only honest check, since pytest has already imported PIL.
         probe = (
-            "import sys; import logit_classifier; import logit_classifier.tags; "
+            f"import sys; import logit_classifier; import {tags_module}; "
             "print([m for m in ('torch', 'transformers', 'fastapi', 'PIL') if m in sys.modules])"
         )
         result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
                                 check=True)
         assert result.stdout.strip() == "[]"
+
+    def test_importing_the_core_loads_no_toolkit(self):
+        # The toolkit uses the core and never mixes into it. A subprocess, since pytest has already imported it.
+        probe = (
+            "import sys; import logit_classifier, logit_classifier.classifier, logit_classifier.schema, "
+            "logit_classifier.prompt, logit_classifier.backends.base, logit_classifier.backends.comfy_clip; "
+            "print(sorted(m for m in sys.modules if m.startswith('logit_classifier.toolkit')))"
+        )
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                                check=True)
+        assert result.stdout.strip() == "[]"
+
+    def test_no_core_module_imports_the_toolkit(self):
+        # A lazy import inside a function escapes the subprocess probe, so every import statement is read.
+        compat = self.SOURCE / "tags.py"
+        core_files = [
+            path for path in sorted(self.SOURCE.rglob("*.py"))
+            if path.relative_to(self.SOURCE).parts[0] != "toolkit" and path != compat
+        ]
+
+        assert self.SOURCE / "classifier.py" in core_files
+        assert _imports_the_toolkit(compat, self.SOURCE)
+        assert [path.name for path in core_files if _imports_the_toolkit(path, self.SOURCE)] == []
 
 
 class TestDeterminismWindow:
@@ -1515,9 +1397,17 @@ class TestPublicSurface:
 
         for name in ("Backend", "BranchLogits", "BackendContractError", "ANSWER_PREFILL",
                      "MAX_LABELS_PER_BRANCH", "verify_label_ids", "verify_backend",
-                     "LogitClassifierError", "COMFY_SOCKET_TYPE", "UnsupportedModelError"):
+                     "LogitClassifierError", "UnsupportedModelError"):
             assert name in pkg.__all__, f"{name} is not exported from the package root"
             assert hasattr(pkg, name)
+
+    def test_the_comfy_socket_type_lives_on_the_comfyui_toolkit(self):
+        import logit_classifier as pkg
+        from logit_classifier.toolkit import comfyui
+
+        assert not hasattr(pkg, "COMFY_SOCKET_TYPE")
+        assert comfyui.COMFY_SOCKET_TYPE == "LOGIT_CLASSIFIER"
+        assert "COMFY_SOCKET_TYPE" in comfyui.__all__
 
     def test_prompt_internals_are_not_frozen_into_the_root(self):
         import logit_classifier as pkg
@@ -2509,7 +2399,7 @@ class TestSharedVisionEncode:
 
     def test_the_same_tensor_is_encoded_once_inside_the_window(self, fake_comfy):
         torch = pytest.importorskip("torch")
-        from logit_classifier.backends.comfy_clip import shared_vision_encode
+        from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = EmbedCountingTransformer()
         data = torch.zeros(1, 4, 4, 3)
@@ -2527,7 +2417,7 @@ class TestSharedVisionEncode:
 
     def test_another_tensor_or_device_encodes_again(self, fake_comfy):
         torch = pytest.importorskip("torch")
-        from logit_classifier.backends.comfy_clip import shared_vision_encode
+        from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = EmbedCountingTransformer()
         data = torch.zeros(1, 4, 4, 3)
@@ -2546,7 +2436,7 @@ class TestSharedVisionEncode:
     )
     def test_any_other_embed_always_reaches_the_original(self, fake_comfy, embed):
         pytest.importorskip("torch")
-        from logit_classifier.backends.comfy_clip import shared_vision_encode
+        from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = EmbedCountingTransformer()
         with shared_vision_encode(FakeClip(transformer=transformer)):
@@ -2562,7 +2452,7 @@ class TestSharedVisionEncode:
         import gc
         import weakref
 
-        from logit_classifier.backends.comfy_clip import shared_vision_encode
+        from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = EmbedCountingTransformer()
         instance_encode = transformer.preprocess_embed
@@ -2589,7 +2479,7 @@ class TestSharedVisionEncode:
 
     def test_a_transformer_without_preprocess_embed_passes_through(self, fake_comfy):
         pytest.importorskip("torch")
-        from logit_classifier.backends.comfy_clip import shared_vision_encode
+        from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = FakeQwenTransformer()
         with shared_vision_encode(FakeClip(transformer=transformer)):

@@ -47,13 +47,8 @@ from .schema import (
 )
 from .vision import ImageError
 
-# The ComfyUI socket type a node pack declares for a loaded classifier. It lives
-# here so the library and the packs cannot drift apart on the spelling.
-COMFY_SOCKET_TYPE = "LOGIT_CLASSIFIER"
-
 __all__ = [
     "ANSWER_PREFILL",
-    "COMFY_SOCKET_TYPE",
     "LABEL_ALPHABET",
     "MAX_LABELS_PER_BRANCH",
     "Answer",
