@@ -1019,7 +1019,19 @@ class TestDropSubsets:
         assert drop_subsets(["red car", "car red"]) == ["red car"]
 
     def test_splits_words_on_hyphens(self):
-        assert drop_subsets(["tomato", "sun-dried tomato", "dried sun"]) == ["sun-dried tomato"]
+        assert drop_subsets(["tomato", "sun-dried tomato", "dried sun"]) == ["sun-dried tomato", "dried sun"]
+
+    def test_folds_a_hyphenated_superset_with_the_same_head(self):
+        assert drop_subsets(["tomato", "sun-dried tomato"]) == ["sun-dried tomato"]
+
+    def test_keeps_a_whole_beside_its_named_parts(self):
+        assert drop_subsets(["cat", "cat ear", "cat paw"]) == ["cat", "cat ear", "cat paw"]
+
+    def test_drops_only_into_a_superset_with_the_same_head(self):
+        assert drop_subsets(["sword", "sword hilt", "steel sword"]) == ["sword hilt", "steel sword"]
+
+    def test_keeps_a_whole_beside_a_longer_part(self):
+        assert drop_subsets(["table", "wooden table leg"]) == ["table", "wooden table leg"]
 
     def test_keeps_order_and_unrelated_items(self):
         assert drop_subsets(["sky", "red car", "car", "tree", "old tree"]) == ["sky", "red car", "old tree"]

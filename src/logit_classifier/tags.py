@@ -152,20 +152,24 @@ def normalize_item(text: str) -> str:
     return " ".join(words)
 
 
-def _word_set(item: str) -> frozenset[str]:
-    return frozenset(word for word in _WORD_BREAKS.split(item) if word)
+def _words(item: str) -> list[str]:
+    return [word for word in _WORD_BREAKS.split(item) if word]
 
 
 def drop_subsets(items: list[str]) -> list[str]:
-    """Drop every item whose words another item holds, keeping the first of equal word sets.
+    """Drop an item whose words a longer item holds under the same head noun, keeping the first of equal word sets.
 
-    Words split on whitespace and hyphens, so "sun-dried tomato" holds "tomato".
+    Words split on whitespace and hyphens, and the head noun is the last word, so "tomato" folds into
+    "sun-dried tomato". "cat" survives "cat ear", since a part named after its whole is another thing.
     """
-    word_sets = [_word_set(item) for item in items]
+    word_lists = [_words(item) for item in items]
+    word_sets = [frozenset(words) for words in word_lists]
+    heads = [words[-1] if words else "" for words in word_lists]
     kept: list[str] = []
 
-    for index, (item, words) in enumerate(zip(items, word_sets, strict=True)):
-        if any(words < other for other in word_sets) or words in word_sets[:index]:
+    for index, (item, words, head) in enumerate(zip(items, word_sets, heads, strict=True)):
+        held = any(words < other and head == other_head for other, other_head in zip(word_sets, heads, strict=True))
+        if held or words in word_sets[:index]:
             continue
         kept.append(item)
     return kept
