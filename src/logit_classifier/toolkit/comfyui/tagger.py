@@ -58,8 +58,8 @@ class TagSettings:
     # In the Logit Tagger's tests-AB/ab_propose_budget.py both images that reached 128 tokens were repeating tags,
     # and 192 added no tag.
     propose_max_tokens: int = 128
-    # Stopping at 25 tags raised no-prompt precision from 0.865 to 0.915 (ContextAnchoredTileRefine tags-bench-log.md).
-    # 40 over 25 added 1.2 correct tags per image at 0.918 against 0.926 (the Logit Tagger's ab_tagger_compare.py).
+    # On fp8, 40 over 25 added 0.85 correct and 0.15 wrong or vague tags per render, and 0.87 and 0.10 per tile
+    # (the Logit Tagger's tests-AB/ab_tagger_score.py --replay, ContextAnchoredTileRefine tests-AB/ab_tags_bench.py).
     propose_cap: int = 25
     # The model's 25 and a long prompt's 30 to 40 tags, in one packed verify pass beside a 1 MP picture
     # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md).
@@ -88,8 +88,8 @@ class TagSettings:
     translate_instruction: str = "Translate this image prompt into English. Output only the translation.\n\n{PROMPT}"
     translate_max_tokens: int = 512
 
-    # No verify threshold separates scene, lighting, color and quality words from things. On the model's tags the
-    # check dropped "watermark" and "pixel art", graded correct (the Logit Tagger's tests-AB/ab_tagger_compare.py).
+    # No verify threshold separates scene, lighting, color and quality words from things. This wording beat five
+    # others at AUC 0.839 on 2,627 judged tags of both packs on fp8.
     thing_question: str = 'What does the image tag "{TAG}" name'
     thing_criteria: tuple[tuple[str, str], ...] = (
         ("thing", "something that could be pointed at in a picture: an object, a person, a group of people "
@@ -100,20 +100,24 @@ class TagSettings:
                   "shape or form, lighting in general, a camera or render effect, a style, a mood, a "
                   "quality or an idea"),
     )
-    # Mid scores mix things with non-things ("chinese characters" 0.45), so only a confident "other" drops a tag.
+    # Mid scores mix things with non-things ("robots" 0.85 on fp8), so only a confident "other" drops a tag.
     thing_threshold: float = 0.9
+    # Judging only the prompt's tags kept "watermark" and "pixel art", and added 0.28 vague tags per render and 0.81
+    # per tile on fp8 (ab_tagger_score.py --replay, ab_tags_bench.py).
     thing_check: str = "all"
 
     # The crop wording "This crop visibly contains {f}" reached AUC 0.963 in this repo's tests-AB/ab_multi_label.py.
-    # Tags at 0.5 to 0.9 on a storm sky tile named a bay and buildings the tile lacks.
+    # "Is there {TAG} in this image?" removed 34 correct tile tags per 4 wrong ones (ab_tags_bench.py).
     verify_statement: str = "This image visibly contains {TAG}"
-    verify_threshold: float = 0.9
+    # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 3 to 4 correct ones on renders, photos and tiles, and
+    # 0.9999 cost about 50 correct tile tags per further one (ab_tagger_score.py --replay, ab_tags_bench.py).
+    verify_threshold: float = 0.999
     # A near name passes 0.9, and 0.9999 cut wrong tags per tile from 0.92 to 0.29 (ContextAnchoredTileRefine
     # tests-AB/tags-bench-log.md).
     prompt_only_threshold: float = 0.9999
 
-    # The "words" rule drops "cat" beside "cat ear", 20% of the correct tags the Logit Tagger's port lost
-    # (tests-AB/ab_tagger_compare.py). The "head-noun" rule keeps it.
+    # The "head-noun" rule keeps "cat" beside "cat ear", and also "stone" beside "stone walls" and "castle" beside
+    # "stone castle tower". On fp8 tiles it added 0.03 wrong tags per tile (ab_tags_bench.py).
     subsets_rule: str = "words"
     order: str = "score"
 

@@ -1265,6 +1265,8 @@ class TestPromptTags:
 
 
 class TestTagPicture:
+    """The fake verify scores sit between 0.9 and 0.999, so each test that keeps tags pins verify_threshold=0.9."""
+
     @pytest.fixture(autouse=True)
     def events(self, monkeypatch):
         """The tagger's vision scope, replaced by one that records its entry and exit, so no torch is needed."""
@@ -1284,7 +1286,7 @@ class TestTagPicture:
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "dog": 0.97}), events=events)
         picture = object()
 
-        trace = tag_picture(clip, classifier, picture, settings=TagSettings(), known={}, on_stage=events.append)
+        trace = tag_picture(clip, classifier, picture, settings=TagSettings(verify_threshold=0.9), known={}, on_stage=events.append)
         assert events == ["enter", "propose", "generate", "classify", "verify", "nouls", "exit"]
         assert clip.tokenize_calls[0][1] == {"images": [picture]}
         assert classifier.noul_calls == [(["This image visibly contains cat", "This image visibly contains dog"],
@@ -1321,7 +1323,7 @@ class TestTagPicture:
     def test_a_reply_holding_a_tag_is_not_proposed_again(self):
         clip = ReplyingClip("objects, cat")
 
-        trace = tag_picture(clip, TaggingClassifier(), object(), settings=TagSettings(), known={})
+        trace = tag_picture(clip, TaggingClassifier(), object(), settings=TagSettings(verify_threshold=0.9), known={})
         assert len(clip.generate_calls) == 1
         assert trace.echo_reply is None
         assert trace.candidates == ("cat",)
@@ -1342,7 +1344,7 @@ class TestTagPicture:
                                        p_other={"sunset glow": 0.95})
         known = {"dog": 0.1}
 
-        trace = tag_picture(clip, classifier, object(), prompt_tags=("dog",), settings=TagSettings(thing_check="all"),
+        trace = tag_picture(clip, classifier, object(), prompt_tags=("dog",), settings=TagSettings(thing_check="all", verify_threshold=0.9),
                             known=known)
         (request, _image), = classifier.classify_calls
         assert len(request.questions) == 2
@@ -1357,7 +1359,7 @@ class TestTagPicture:
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "sunset glow": 0.95}),
                                        p_other={"sunset glow": 0.95})
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt"), known={})
+        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", verify_threshold=0.9), known={})
         assert classifier.classify_calls == []
         assert trace.candidates == ("cat", "sunset glow")
         assert trace.dropped == ()
@@ -1369,7 +1371,7 @@ class TestTagPicture:
             {"cat": 0.9, "owl": 0.9, "bird": 0.89, "dog": 0.999, "fox": 0.9999}))
 
         trace = tag_picture(clip, classifier, object(), prompt_tags=("owl", "dog", "fox"),
-                            settings=TagSettings(thing_check="prompt"), known={})
+                            settings=TagSettings(thing_check="prompt", verify_threshold=0.9), known={})
         assert trace.candidates == ("cat", "owl", "bird", "dog", "fox")
         assert trace.origins == ("model", "both", "model", "prompt", "prompt")
         assert trace.verified == ("cat", "owl", "fox")
@@ -1393,7 +1395,7 @@ class TestTagPicture:
         clip = ReplyingClip("cat, owl, bird, dog")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "owl": 0.99, "bird": 0.97, "dog": 0.95}))
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", order=order),
+        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", order=order, verify_threshold=0.9),
                             known={})
         assert trace.kept == kept
 
@@ -1402,7 +1404,7 @@ class TestTagPicture:
         clip = ReplyingClip("cat, cat ear")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "cat ear": 0.99}))
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", subsets_rule=rule),
+        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", subsets_rule=rule, verify_threshold=0.9),
                             known={})
         assert trace.verified == ("cat", "cat ear")
         assert trace.kept == kept
