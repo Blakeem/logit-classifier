@@ -347,8 +347,9 @@ tags = drop_subsets(parse_candidates("red car, car, wooden bench, bench"))
 # ['red car', 'wooden bench']
 ```
 
-`drop_subsets(tags, rule="head-noun")` drops a tag only into a longer tag that ends in the
-same noun. So "cat" stays beside "cat ear".
+`drop_subsets(tags, rule="head-noun")` drops a tag only into a longer tag with the same head
+noun. The head noun is the last word before "of", "in", "on", "with" or "reading". So "cat"
+stays beside "cat ear", and "signage" is dropped beside "signage in chinese".
 
 ### ComfyUI Tools
 
