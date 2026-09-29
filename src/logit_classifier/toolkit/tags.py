@@ -53,15 +53,10 @@ PROMPT_STOP_WORDS = frozenset({"a", "an", "the", "of", "with", "and", "in", "on"
 _PROMPT_WORD = re.compile(r"[a-z0-9]+")
 _PLURAL_CUTS = (("s", ""), ("es", ""), ("ies", "y"))
 
-# AUC 0.996 on COCO photos in the Logit Tagger's tests-AB/ab_question_shapes.py.
-PRESENCE_WORDING = "Is there {THING} in this image?"
-_THING = "{THING}"
-ARTICLES = frozenset({"a", "an", "the", "some"})
-NUMBER_WORDS = frozenset({"two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"})
-IRREGULAR_PLURALS = frozenset({"people", "children", "cacti", "mice"})
-# Head nouns that take no article, so a question never reads "Is there a water in this image?".
-MASS_NOUNS = frozenset({"water", "butter", "steam", "rain", "sunlight", "dust", "grass", "lightning", "armor",
-                        "flour", "fruit", "syrup", "hair", "snow", "cheese", "linen", "dough", "spray"})
+# On judged tile candidates this matched 0.3.0's "Is there a {TAG} in this image?" within every paired interval, and it
+# needs no article or number (the Logit Tagger's tests-AB/ab_presence_wording.py, round 4).
+PRESENCE_STATEMENT = "This image visibly contains {TAG}"
+_TAG = "{TAG}"
 
 
 def _full_initialisms(text: str) -> str:
@@ -335,38 +330,31 @@ def passed_by_origin(candidates: Sequence[str], origins: Sequence[str], scores: 
     return tuple(passed)
 
 
-def _first_word(phrase: str) -> str:
-    words = phrase.split()
+def presence_statement(tag: str, *, wording: str = PRESENCE_STATEMENT) -> str:
+    """Return the wording with {TAG} replaced by the tag as given."""
+    stripped_tag = tag.strip()
 
-    if not words:
-        raise ValueError(f"A thing needs at least one word, got {phrase!r}.")
-    return words[0].lower()
-
-
-def reads_plural(phrase: str) -> bool:
-    """Return whether the phrase names more than one thing: it opens with a count or its head_noun is plural."""
-    first = _first_word(phrase)
-    head = head_noun(phrase)
-
-    if first in NUMBER_WORDS or first.isdigit() or head in IRREGULAR_PLURALS or head.endswith("men"):
-        return True
-    return head.endswith("s") and not head.endswith(("ss", "us"))
+    if _TAG not in wording:
+        raise ValueError(f"presence_statement got wording {wording!r}, which lacks {_TAG}. Put {_TAG} where "
+                         f"the tag goes.")
+    if not stripped_tag:
+        raise ValueError(f"A tag needs at least one word, got {tag!r}.")
+    return wording.replace(_TAG, stripped_tag)
 
 
-def with_article(phrase: str) -> str:
-    """Return the phrase with a or an, unless it opens with an article or a count, reads plural or names a mass noun."""
-    first = _first_word(phrase)
+class PresenceThresholds(NamedTuple):
+    """The scores a presence statement must reach to keep its tag.
 
-    if first in ARTICLES or first in NUMBER_WORDS or first.isdigit() or reads_plural(phrase):
-        return phrase
-    if head_noun(phrase) in MASS_NOUNS:
-        return phrase
-    return f"{'an' if first[0] in 'aeiou' else 'a'} {phrase}"
+    `proposed` applies to a tag the model listed, and `declared` to a tag it did not list, such as a prompt's thing.
+    """
+
+    proposed: float
+    declared: float
 
 
-def presence_question(thing: str, *, wording: str = PRESENCE_WORDING) -> str:
-    """Return the wording with {THING} replaced by the thing and the article its head noun takes."""
-    if _THING not in wording:
-        raise ValueError(f"presence_question got wording {wording!r}, which lacks {_THING}. Put {_THING} where "
-                         f"the thing goes.")
-    return wording.replace(_THING, with_article(thing))
+# On ContextAnchoredTileRefine's recorded fp8 tile runs this kept 12.32 correct and 0.54 wrong or vague tags per tile,
+# precision 0.958 (tests-AB/ab_tags_paired.py).
+BROAD_THRESHOLDS = PresenceThresholds(proposed=0.999, declared=0.9999)
+# On ContextAnchoredTileRefine's recorded fp8 tile runs this kept 7.33 correct and 0.17 wrong or vague tags per tile,
+# precision 0.977 (tests-AB/ab_tags_paired.py).
+STRICT_THRESHOLDS = PresenceThresholds(proposed=0.99998, declared=0.99998)

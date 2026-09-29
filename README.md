@@ -145,7 +145,7 @@ the model.
 
 ```json
 {
-  "model": "logit-classifier-0.3.0",
+  "model": "logit-classifier-0.4.0",
   "answers": {
     "department": {
       "type": "choice",
@@ -338,7 +338,8 @@ and the classifier never imports the toolkit.
 | `drop_subsets` | drops a tag whose words all appear in a longer tag |
 | `prompt_word_forms`, `in_prompt` | test whether a tag's words appear in a prompt, singular or plural |
 | `merge_candidates` | merges proposed tags with a prompt's tags under a cap |
-| `presence_question` | writes "Is there a car in this image?" with the article the thing takes |
+| `presence_statement` | writes "This image visibly contains car" with the tag as given |
+| `BROAD_THRESHOLDS`, `STRICT_THRESHOLDS` | the scores a tag must reach, broad for more tags and strict for fewer wrong ones |
 
 ```python
 from logit_classifier.toolkit.tags import drop_subsets, parse_candidates
@@ -383,6 +384,16 @@ tags = trace.kept
 `TagSettings` defaults are the current measured values, and a later release may change them.
 Pass every value your output depends on to keep it fixed.
 
+For fewer wrong tags, pass `STRICT_THRESHOLDS.proposed` as `verify_threshold` and
+`STRICT_THRESHOLDS.declared` as `prompt_only_threshold`.
+
+```python
+from logit_classifier.toolkit.tags import STRICT_THRESHOLDS
+
+settings = TagSettings(verify_threshold=STRICT_THRESHOLDS.proposed,
+                       prompt_only_threshold=STRICT_THRESHOLDS.declared)
+```
+
 ## Differences From Jev
 
 This project matches the System One request and response format and the documented limits.
@@ -401,13 +412,13 @@ Jev publishes status codes but no error body. The error shape here is our own.
 
 ```
 uv sync --all-extras
-uv run pytest tests/test_unit.py
-uv run pytest tests/test_model.py -m model
+uv run python -m pytest tests -m "not model"
+uv run python -m pytest tests/test_model.py -m model
 uv run ruff check .
 uv run mypy
 ```
 
-The unit tests need no weights. The model tests load the GPU and take about 15 seconds.
+The unit tests need no weights. The model tests load the GPU and take 24 to 126 seconds, the longer run being the first of a session.
 
 `FINDINGS.md` is the measurement record. Every number there names the script in
 `tests-AB/` that produced it.

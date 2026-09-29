@@ -295,6 +295,31 @@ dispatcher reaches the math backend, which builds the full attention matrix. Mea
 `HFBackend` probes the backends at startup, at the model's own dtype, and pins the working
 ones. `benchmark.py`.
 
+## One presence wording, two threshold pairs
+
+Correct tags per tile at a pooled precision, over 905 judged tile candidates on 23 tiles,
+from the Logit Tagger's `tests-AB/ab_presence_wording.py` (round 4).
+
+| Wording | P 0.95 | P 0.97 | P 0.98 | P 0.99 |
+|---|---|---|---|---|
+| "This image visibly contains {TAG}" | 17.43 | 12.78 | 9.87 | 6.04 |
+| "Is there a {TAG} in this image?" (0.3.0, article by rule) | 17.35 | 11.30 | 2.39 | 2.09 |
+| "Present in this image: {TAG}" | 17.61 | 8.74 | 8.13 | 6.74 |
+
+The shipped fp8 tile pass cut offline, per tile and prompt over 69 runs, from
+ContextAnchoredTileRefine's `tests-AB/ab_tags_paired.py`.
+
+| Thresholds | Correct | Wrong or vague | Precision |
+|---|---|---|---|
+| broad (0.999, 0.9999) | 12.32 | 0.54 | 0.958 |
+| strict (0.99998, 0.99998) | 7.33 | 0.17 | 0.977 |
+
+Every paired interval against "This image visibly contains {TAG}" at 0.95 and 0.98 spans zero.
+It needs no grammar, and the tile pass already asked it, so its thresholds carry over. On
+declared COCO tag lists "Is there a {TAG} in this image?" (0.3.0, article by rule) kept more
+correct tags at precision 0.98 (3.79 against 1.90 per image), which is the cost of one
+wording.
+
 ## Bugs found and fixed
 
 | Bug | Effect | Fix |
@@ -329,6 +354,6 @@ and 23.66 GB against 15.12 GB, because a cropped cache is a non-contiguous view.
 
 ## Layout
 
-`tests/` holds the pytest suite, 146 unit tests and 14 that need the GPU. `tests-AB/` holds
+`tests/` holds the pytest suite, the unit tests and 14 tests that need the GPU. `tests-AB/` holds
 the measurement harnesses, matching ComfyUI-ContextAnchoredTileRefine. Fixtures live in
 `tests/fixtures/` and `tests-AB/ab_env.py` points at them.

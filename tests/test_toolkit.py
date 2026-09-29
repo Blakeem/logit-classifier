@@ -39,9 +39,12 @@ from logit_classifier.toolkit.comfyui import (
 from logit_classifier.toolkit.comfyui import classifier as comfyui_classifier
 from logit_classifier.toolkit.comfyui import tagger as comfyui_tagger
 from logit_classifier.toolkit.tags import (
+    BROAD_THRESHOLDS,
     MAX_CANDIDATES,
-    PRESENCE_WORDING,
+    PRESENCE_STATEMENT,
+    STRICT_THRESHOLDS,
     MergedCandidates,
+    PresenceThresholds,
     clean_item,
     complete_tags,
     drop_subsets,
@@ -52,13 +55,11 @@ from logit_classifier.toolkit.tags import (
     normalize_item,
     parse_candidates,
     passed_by_origin,
-    presence_question,
+    presence_statement,
     prompt_word_forms,
-    reads_plural,
     repeated_block,
     split_prompt,
     tag_stop,
-    with_article,
 )
 
 
@@ -466,45 +467,39 @@ class TestPassedByOrigin:
                              thresholds={"model": 0.9})
 
 
-class TestPresenceQuestion:
-    @pytest.mark.parametrize(("thing", "question"), [
-        ("cat", "Is there a cat in this image?"),
-        ("apple", "Is there an apple in this image?"),
-        ("two dogs", "Is there two dogs in this image?"),
-        ("3 cups", "Is there 3 cups in this image?"),
-        ("people", "Is there people in this image?"),
-        ("fishermen", "Is there fishermen in this image?"),
-        ("water", "Is there water in this image?"),
-        ("wheels of cheese", "Is there wheels of cheese in this image?"),
-        ("glass of water", "Is there a glass of water in this image?"),
-        ("bus", "Is there a bus in this image?"),
-        ("the moon", "Is there the moon in this image?"),
-        ("some grass", "Is there some grass in this image?"),
-    ])
-    def test_gives_the_thing_the_article_its_head_noun_takes(self, thing, question):
-        assert presence_question(thing) == question
+class TestPresenceStatement:
+    @pytest.mark.parametrize("tag", ["cat", "apples", "two dogs", "people", "sand", "the moon", "salt and pepper shakers"])
+    def test_inserts_the_tag_verbatim(self, tag):
+        assert presence_statement(tag) == f"This image visibly contains {tag}"
+
+    def test_strips_the_space_around_the_tag(self):
+        assert presence_statement("  cat  ") == "This image visibly contains cat"
+
+    def test_keeps_braces_in_the_tag_literally(self):
+        assert presence_statement("{TAG} sign") == "This image visibly contains {TAG} sign"
 
     def test_the_default_wording_is_the_presence_wording(self):
-        assert presence_question("cat") == PRESENCE_WORDING.replace("{THING}", "a cat")
+        assert presence_statement("cat") == PRESENCE_STATEMENT.replace("{TAG}", "cat")
 
     def test_takes_the_wording_as_an_argument(self):
-        assert presence_question("owl", wording="Can you see {THING}? Is it {THING}?") == (
-            "Can you see an owl? Is it an owl?"
-        )
+        assert presence_statement("owl", wording="Can you see {TAG}? Is it {TAG}?") == "Can you see owl? Is it owl?"
 
-    def test_rejects_a_wording_with_no_thing(self):
-        with pytest.raises(ValueError, match=r"lacks \{THING\}"):
-            presence_question("cat", wording="Is there a cat?")
+    def test_rejects_a_wording_with_no_tag(self):
+        with pytest.raises(ValueError, match=r"lacks \{TAG\}"):
+            presence_statement("cat", wording="Is there a cat?")
 
-    @pytest.mark.parametrize("thing", ["", "   "])
-    def test_rejects_an_empty_thing(self, thing):
+    @pytest.mark.parametrize("tag", ["", "   "])
+    def test_rejects_an_empty_tag(self, tag):
         with pytest.raises(ValueError, match="at least one word"):
-            presence_question(thing)
+            presence_statement(tag)
 
-    def test_reads_plural_follows_the_head_noun(self):
-        assert reads_plural("sun-dried tomatoes")
-        assert not reads_plural("sign reading welcome friends")
-        assert with_article("sign reading welcome friends") == "a sign reading welcome friends"
+
+class TestPresenceThresholds:
+    def test_strict_is_at_least_broad_in_each_field(self):
+        assert isinstance(BROAD_THRESHOLDS, PresenceThresholds)
+        assert isinstance(STRICT_THRESHOLDS, PresenceThresholds)
+        for broad, strict in zip(BROAD_THRESHOLDS, STRICT_THRESHOLDS, strict=True):
+            assert strict >= broad
 
 
 class InterruptProcessingException(BaseException):
@@ -1100,6 +1095,13 @@ class TestTagSettings:
         assert logit_tagger != tile_refine
         assert hash(logit_tagger) != hash(tile_refine)
 
+    def test_the_defaults_are_the_presence_wording_and_the_broad_thresholds(self):
+        settings = TagSettings()
+
+        assert settings.verify_statement == PRESENCE_STATEMENT
+        assert settings.verify_threshold == BROAD_THRESHOLDS.proposed
+        assert settings.prompt_only_threshold == BROAD_THRESHOLDS.declared
+
     def test_an_empty_verify_statement_needs_no_tag(self):
         assert TagSettings(verify_statement="").verify_statement == ""
 
@@ -1295,6 +1297,17 @@ class TestTagPicture:
         assert trace.kept == ("dog", "cat")
         assert trace.propose_ms >= 0.0
         assert trace.verify_ms >= 0.0
+
+    def test_verify_asks_the_settings_wording(self):
+        clip = ReplyingClip("cat, dog")
+        classifier = TaggingClassifier(nouls={"Seen: cat": 0.95, "Seen: dog": 0.97})
+        picture = object()
+        settings = TagSettings(verify_statement="Seen: {TAG}", verify_threshold=0.9, thing_check="prompt")
+
+        trace = tag_picture(clip, classifier, picture, settings=settings, known={})
+        assert classifier.noul_calls == [([presence_statement(tag, wording="Seen: {TAG}") for tag in ("cat", "dog")],
+                                          picture, "")]
+        assert trace.kept == ("dog", "cat")
 
     def test_propose_stops_at_the_cap(self):
         clip = DecodingClip(words_of("cat, dog, fox, owl"))

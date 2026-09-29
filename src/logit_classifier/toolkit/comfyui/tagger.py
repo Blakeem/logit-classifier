@@ -15,12 +15,15 @@ from typing import Any
 from ...classifier import Classifier
 from ...schema import ChoiceAnswer, ChoiceQuestion, JSONContent, Question, SystemOneRequest
 from ..tags import (
+    BROAD_THRESHOLDS,
+    PRESENCE_STATEMENT,
     MergedCandidates,
     drop_subsets,
     in_prompt,
     merge_candidates,
     parse_candidates,
     passed_by_origin,
+    presence_statement,
     prompt_word_forms,
     tag_stop,
 )
@@ -61,15 +64,14 @@ class TagSettings:
     # On fp8, 40 over 25 added 0.85 correct and 0.15 wrong or vague tags per render, and 0.87 and 0.10 per tile
     # (the Logit Tagger's tests-AB/ab_tagger_score.py --replay, ContextAnchoredTileRefine tests-AB/ab_tags_bench.py).
     propose_cap: int = 25
-    # The model's 25 and a long prompt's 30 to 40 tags, in one packed verify pass beside a 1 MP picture
-    # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md).
+    # The model's 25 and a long prompt's about 40 tags, in one packed verify pass beside a 1 MP picture
+    # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md, section 7).
     merge_cap: int = 64
     # The propose wording's own nouns came back as tags and passed verify (ContextAnchoredTileRefine
     # tests-AB/ab_tile_tags.py).
     category_nouns: frozenset[str] = frozenset({"objects", "people", "animals", "clothing", "materials", "setting"})
 
-    # A 500 word prompt listed 28 to 45 tags in 70 to 256 tokens (ContextAnchoredTileRefine tags-bench-log.md). Past
-    # the prompt's own things the model pads the list with words the prompt lacks, so a streak of them ends it.
+    # Past the prompt's own things the model pads the list with words the prompt lacks, so a streak of them ends it.
     prompt_tags_instruction: str = (
         "This is a prompt for an image:\n{PROMPT}\n\nList the physical things the prompt names that "
         "could be pointed at in the image: objects, people, animals, plants, clothing, materials, "
@@ -106,15 +108,14 @@ class TagSettings:
     # per tile on fp8 (ab_tagger_score.py --replay, ab_tags_bench.py).
     thing_check: str = "all"
 
-    # The crop wording "This crop visibly contains {f}" reached AUC 0.963 in this repo's tests-AB/ab_multi_label.py.
-    # "Is there {TAG} in this image?" removed 34 correct tile tags per 4 wrong ones (ab_tags_bench.py).
-    verify_statement: str = "This image visibly contains {TAG}"
+    # The toolkit's presence wording (toolkit/tags.py), which the Logit Tagger asks of a listed tag and a prompt's thing.
+    verify_statement: str = PRESENCE_STATEMENT
     # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 2.6 to 4.0 correct ones on renders, photos and tiles,
     # and 0.9999 cost about 50 correct tile tags per further one (ab_tagger_score.py --replay, ab_tags_bench.py).
-    verify_threshold: float = 0.999
-    # A near name passes 0.9, and 0.9999 cut wrong tags per tile from 0.92 to 0.29 (ContextAnchoredTileRefine
-    # tests-AB/tags-bench-log.md).
-    prompt_only_threshold: float = 0.9999
+    verify_threshold: float = BROAD_THRESHOLDS.proposed
+    # A near name passes 0.9, and 0.9999 cut wrong tags per tile from 0.83 to 0.29 on the hold-out tiles
+    # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md, sections 8 and 10).
+    prompt_only_threshold: float = BROAD_THRESHOLDS.declared
 
     # The "head-noun" rule keeps "cat" beside "cat ear", and also "stone" beside "stone walls" and "castle" beside
     # "stone castle tower". On fp8 tiles it added 0.03 wrong or vague tags per tile (ab_tags_bench.py).
@@ -372,7 +373,8 @@ def tag_picture(
         started = time.perf_counter()
         if settings.verify_statement:
             verify_scores = tuple(classifier.nouls(
-                [settings.verify_statement.replace(_TAG, tag) for tag in merged.candidates], image=picture))
+                [presence_statement(tag, wording=settings.verify_statement) for tag in merged.candidates],
+                image=picture))
             verified = passed_by_origin(merged.candidates, merged.origins, verify_scores, thresholds=thresholds)
             scores = verify_scores
         else:
