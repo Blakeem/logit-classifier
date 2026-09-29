@@ -12,7 +12,7 @@ from ...backends.comfy_clip import _clip_parts, _resident
 
 @contextmanager
 def shared_vision_encode(clip: Any) -> Iterator[None]:
-    """Run the vision tower once per picture tensor for the duration, shared by generate and classify.
+    """Run the vision tower once per image tensor for the duration, shared by generate and classify.
 
     Each encode runs inside the determinism window, where classify always ran it, so its
     scores are unchanged. A transformer without core's preprocess_embed passes through.

@@ -18,22 +18,22 @@ from logit_classifier.toolkit import comfyui
 from logit_classifier.toolkit import tags as toolkit_tags
 from logit_classifier.toolkit.comfyui import (
     IMAGE_SLOT,
-    PromptTags,
+    PromptTagTrace,
     TagSettings,
     chat,
     clip_generate,
     comfy_classifier,
-    english_text,
-    fit_picture,
+    fit_image,
     generate_text,
-    prompt_tags,
     routed_progress_bars,
     run_outcome,
     send_status,
     skip_resident_loads,
     stop_when,
-    tag_picture,
+    tag_image,
+    tag_prompt,
     thing_scores,
+    to_english,
     token_fill,
 )
 from logit_classifier.toolkit.comfyui import classifier as comfyui_classifier
@@ -1054,11 +1054,11 @@ class ReplyingClip(GeneratingClip):
 
 
 class TaggingClassifier:
-    """Classifier, down to nouls and classify, with nouls scripted by statement and p("other") by quoted tag."""
+    """Classifier, down to nouls and classify, with nouls scripted by statement and p("thing") by quoted tag."""
 
-    def __init__(self, nouls=None, p_other=None, events=None, answer=ChoiceAnswer):
+    def __init__(self, nouls=None, p_thing=None, events=None, answer=ChoiceAnswer):
         self.noul_of = nouls or {}
-        self.p_other = p_other or {}
+        self.p_thing = p_thing or {}
         self.events = events if events is not None else []
         self.answer = answer
         self.noul_calls = []
@@ -1075,10 +1075,14 @@ class TaggingClassifier:
         self.events.append("classify")
         self.classify_calls.append((request, image))
         for qid, question in request.questions.items():
-            p = self.p_other.get(question.instructions.split('"')[1], 0.0)
+            p = self.p_thing.get(question.instructions.split('"')[1], 1.0)
             answers[qid] = (NoulAnswer(noul=p) if self.answer is NoulAnswer else
-                            ChoiceAnswer(choice="other", confidence=p, probabilities={"thing": 1.0 - p, "other": p}))
+                            ChoiceAnswer(choice="thing", confidence=p, probabilities={"thing": p, "other": 1.0 - p}))
         return SimpleNamespace(answers=answers), None
+
+
+# The fake verify scores sit below the broad proposed threshold, so a test that keeps model tags lowers it.
+LOW_PROPOSED = PresenceThresholds(proposed=0.9, declared=BROAD_THRESHOLDS.declared)
 
 
 class TestTagSettings:
@@ -1090,7 +1094,7 @@ class TestTagSettings:
         logit_tagger = TagSettings(propose_cap=40, merge_cap=80, thing_check="prompt", subsets_rule="head-noun",
                                    order="score")
         tile_refine = TagSettings(propose_cap=25, merge_cap=64, thing_check="all", subsets_rule="words",
-                                  order="proposed", language_question=None, echo_fallback_instruction=None)
+                                  order="candidate", language_question=None, echo_fallback_instruction=None)
 
         assert logit_tagger != tile_refine
         assert hash(logit_tagger) != hash(tile_refine)
@@ -1099,8 +1103,7 @@ class TestTagSettings:
         settings = TagSettings()
 
         assert settings.verify_statement == PRESENCE_STATEMENT
-        assert settings.verify_threshold == BROAD_THRESHOLDS.proposed
-        assert settings.prompt_only_threshold == BROAD_THRESHOLDS.declared
+        assert settings.verify_thresholds == BROAD_THRESHOLDS
 
     def test_an_empty_verify_statement_needs_no_tag(self):
         assert TagSettings(verify_statement="").verify_statement == ""
@@ -1121,9 +1124,12 @@ class TestTagSettings:
         pytest.param("english_threshold", 0.0, r"english_threshold=0\.0\. Use a value above 0 and at most 1",
                      id="english-threshold-zero"),
         pytest.param("thing_threshold", 1.5, r"thing_threshold=1\.5\. Use a value above 0", id="thing-threshold-high"),
-        pytest.param("verify_threshold", -0.1, r"verify_threshold=-0\.1\. Use", id="verify-threshold-negative"),
-        pytest.param("prompt_only_threshold", float("nan"), r"prompt_only_threshold=nan\. Use",
-                     id="prompt-only-threshold-nan"),
+        pytest.param("verify_thresholds", PresenceThresholds(-0.1, 0.9999), r"verify_thresholds\.proposed=-0\.1\. Use",
+                     id="proposed-threshold-negative"),
+        pytest.param("verify_thresholds", PresenceThresholds(0.999, float("nan")),
+                     r"verify_thresholds\.declared=nan\. Use", id="declared-threshold-nan"),
+        pytest.param("verify_thresholds", (0.999, 0.9999),
+                     r"verify_thresholds=\(0\.999, 0\.9999\)\. Use a PresenceThresholds", id="plain-tuple"),
         pytest.param("propose_max_tokens", 0, r"propose_max_tokens=0\. Use 1 or more", id="propose-budget"),
         pytest.param("propose_cap", 0, r"propose_cap=0\. Use 1 or more", id="propose-cap"),
         pytest.param("merge_cap", 0, r"merge_cap=0\. Use 1 or more", id="merge-cap"),
@@ -1134,7 +1140,7 @@ class TestTagSettings:
         pytest.param("thing_check", "some", r"thing_check='some'\. Use 'all' or 'prompt'", id="thing-check"),
         pytest.param("subsets_rule", "letters", r"subsets_rule='letters'\. Use 'words' or 'head-noun'",
                      id="subsets-rule"),
-        pytest.param("order", "alphabetical", r"order='alphabetical'\. Use 'score' or 'proposed'", id="order"),
+        pytest.param("order", "alphabetical", r"order='alphabetical'\. Use 'score' or 'candidate'", id="order"),
         pytest.param("thing_criteria", (("thing", "an object"),), r"thing_criteria with the keys \['thing'\]",
                      id="thing-criteria"),
     ])
@@ -1145,21 +1151,21 @@ class TestTagSettings:
 
 class TestThingScores:
     def test_asks_each_unknown_tag_once_in_one_text_only_request(self):
-        classifier = TaggingClassifier(p_other={"sunset": 0.95, "cat": 0.1})
+        classifier = TaggingClassifier(p_thing={"sunset": 0.05, "cat": 0.9})
         settings = TagSettings()
-        known = {"dog": 0.2}
+        thing_cache = {"dog": 0.8}
 
-        scores = thing_scores(classifier, ["cat", "dog", "sunset", "cat"], settings, known)
+        scores = thing_scores(classifier, ["cat", "dog", "sunset", "cat"], settings, thing_cache)
         (request, image), = classifier.classify_calls
-        assert scores == (0.1, 0.2, 0.95, 0.1)
+        assert scores == (0.9, 0.8, 0.05, 0.9)
         assert image is None
         assert request.state == ""
         assert [question.instructions for question in request.questions.values()] == [
             'What does the image tag "cat" name', 'What does the image tag "sunset" name']
         assert all(question.criteria == dict(settings.thing_criteria) for question in request.questions.values())
-        assert known == {"dog": 0.2, "cat": 0.1, "sunset": 0.95}
+        assert thing_cache == {"dog": 0.8, "cat": 0.9, "sunset": 0.05}
 
-    def test_known_tags_make_no_request(self):
+    def test_cached_tags_make_no_request(self):
         classifier = TaggingClassifier()
 
         assert thing_scores(classifier, ["cat"], TagSettings(), {"cat": 0.3}) == (0.3,)
@@ -1178,13 +1184,13 @@ class TestThingScores:
             thing_scores(TaggingClassifier(answer=NoulAnswer), ["cat"], TagSettings(), {})
 
 
-class TestEnglishText:
+class TestToEnglish:
     @pytest.mark.parametrize("english", [0.97, 0.5], ids=["confident", "at-the-threshold"])
     def test_an_english_prompt_skips_the_translation(self, english):
         clip = ReplyingClip()
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: english})
 
-        assert english_text(clip, classifier, "a red car", TagSettings()) == "a red car"
+        assert to_english(clip, classifier, "a red car", TagSettings()) == "a red car"
         assert classifier.noul_calls == [([LANGUAGE_QUESTION], None, "a red car")]
         assert clip.generate_calls == []
 
@@ -1193,7 +1199,7 @@ class TestEnglishText:
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.02})
         settings = TagSettings()
 
-        assert english_text(clip, classifier, "un coche {rojo}", settings) == "a red car at night"
+        assert to_english(clip, classifier, "un coche {rojo}", settings) == "a red car at night"
         (text, _kwargs), = clip.tokenize_calls
         (_tokens, generate_kwargs), = clip.generate_calls
         assert text == chat(settings.translate_instruction.replace("{PROMPT}", "un coche {rojo}"))
@@ -1203,56 +1209,56 @@ class TestEnglishText:
         clip = ReplyingClip("a red car, at ni")
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.02})
 
-        assert english_text(clip, classifier, "un coche", TagSettings(translate_max_tokens=3)) == "a red car, at ni"
+        assert to_english(clip, classifier, "un coche", TagSettings(translate_max_tokens=3)) == "a red car, at ni"
 
     def test_a_blank_translation_gives_the_prompt_back(self):
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.02})
 
-        assert english_text(ReplyingClip("  \n"), classifier, "un coche", TagSettings()) == "un coche"
+        assert to_english(ReplyingClip("  \n"), classifier, "un coche", TagSettings()) == "un coche"
 
     def test_no_language_question_turns_the_gate_off(self):
         clip = ReplyingClip()
         classifier = TaggingClassifier()
 
-        assert english_text(clip, classifier, "un coche", TagSettings(language_question=None)) == "un coche"
+        assert to_english(clip, classifier, "un coche", TagSettings(language_question=None)) == "un coche"
         assert classifier.noul_calls == []
         assert clip.generate_calls == []
 
 
-class TestPromptTags:
+class TestTagPrompt:
     @pytest.mark.parametrize("prompt", ["", "   \n"], ids=["empty", "blank"])
     def test_a_blank_prompt_makes_no_request(self, prompt):
         clip = ReplyingClip()
         classifier = TaggingClassifier()
 
-        assert prompt_tags(clip, classifier, prompt, TagSettings(), {}) == PromptTags(
-            text="", reply="", listed=(), p_other=(), tags=())
+        assert tag_prompt(clip, classifier, prompt, TagSettings(), {}) == PromptTagTrace(
+            text="", reply="", listed=(), p_thing=(), tags=())
         assert clip.tokenize_calls == []
         assert classifier.noul_calls == []
         assert classifier.classify_calls == []
 
     def test_lists_the_grounded_things_the_thing_check_keeps(self):
         clip = ReplyingClip("red car, tree, sunset, blue sky")
-        classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_other={"sunset": 0.95, "tree": 0.2})
+        classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_thing={"sunset": 0.05, "tree": 0.8})
         settings = TagSettings()
-        known = {}
+        thing_cache = {}
 
-        result = prompt_tags(clip, classifier, "a red car under a tree at sunset", settings, known)
+        result = tag_prompt(clip, classifier, "a red car under a tree at sunset", settings, thing_cache)
         (text, _kwargs), = clip.tokenize_calls
         (_tokens, generate_kwargs), = clip.generate_calls
-        assert result == PromptTags(text="a red car under a tree at sunset", reply="red car, tree, sunset, blue sky",
-                                    listed=("red car", "tree", "sunset"), p_other=(0.0, 0.2, 0.95),
-                                    tags=("red car", "tree"))
+        assert result == PromptTagTrace(text="a red car under a tree at sunset",
+                                        reply="red car, tree, sunset, blue sky", listed=("red car", "tree", "sunset"),
+                                        p_thing=(1.0, 0.8, 0.05), tags=("red car", "tree"))
         assert text == chat(settings.prompt_tags_instruction.replace("{PROMPT}", "a red car under a tree at sunset"))
         assert generate_kwargs == {"do_sample": False, "max_length": 256}
-        assert known == {"red car": 0.0, "tree": 0.2, "sunset": 0.95}
+        assert thing_cache == {"red car": 1.0, "tree": 0.8, "sunset": 0.05}
 
     def test_lists_and_grounds_from_the_translation(self):
         clip = ReplyingClip("a red car", "red car, coche")
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.01})
         settings = TagSettings()
 
-        result = prompt_tags(clip, classifier, "un coche rojo", settings, {})
+        result = tag_prompt(clip, classifier, "un coche rojo", settings, {})
         assert result.text == "a red car"
         assert result.listed == ("red car",)
         assert clip.tokenize_calls[1][0] == chat(settings.prompt_tags_instruction.replace("{PROMPT}", "a red car"))
@@ -1261,14 +1267,19 @@ class TestPromptTags:
         clip = DecodingClip(words_of("red car, blue sky, green hills, tree"))
         classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.99})
 
-        result = prompt_tags(clip, classifier, "a red car beside a tree", TagSettings(), {})
+        result = tag_prompt(clip, classifier, "a red car beside a tree", TagSettings(), {})
         assert result.reply == "red car, blue sky, green hills"
         assert result.listed == ("red car",)
 
+    def test_a_tag_at_the_thing_threshold_is_kept(self):
+        clip = ReplyingClip("red car, tree")
+        classifier = TaggingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_thing={"tree": 0.1})
 
-class TestTagPicture:
-    """The fake verify scores sit between 0.9 and 0.999, so each test that keeps tags pins verify_threshold=0.9."""
+        result = tag_prompt(clip, classifier, "a red car under a tree", TagSettings(), {})
+        assert result.tags == ("red car", "tree")
 
+
+class TestTagImage:
     @pytest.fixture(autouse=True)
     def events(self, monkeypatch):
         """The tagger's vision scope, replaced by one that records its entry and exit, so no torch is needed."""
@@ -1286,13 +1297,14 @@ class TestTagPicture:
     def test_propose_check_and_verify_share_one_vision_scope(self, events):
         clip = ReplyingClip("cat, dog", events=events)
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "dog": 0.97}), events=events)
-        picture = object()
+        image = object()
 
-        trace = tag_picture(clip, classifier, picture, settings=TagSettings(verify_threshold=0.9), known={}, on_stage=events.append)
+        trace = tag_image(clip, classifier, image, settings=TagSettings(verify_thresholds=LOW_PROPOSED), thing_cache={},
+                          on_stage=events.append)
         assert events == ["enter", "propose", "generate", "classify", "verify", "nouls", "exit"]
-        assert clip.tokenize_calls[0][1] == {"images": [picture]}
+        assert clip.tokenize_calls[0][1] == {"images": [image]}
         assert classifier.noul_calls == [(["This image visibly contains cat", "This image visibly contains dog"],
-                                          picture, "")]
+                                          image, "")]
         assert trace.scores == (0.95, 0.97)
         assert trace.kept == ("dog", "cat")
         assert trace.propose_ms >= 0.0
@@ -1301,19 +1313,19 @@ class TestTagPicture:
     def test_verify_asks_the_settings_wording(self):
         clip = ReplyingClip("cat, dog")
         classifier = TaggingClassifier(nouls={"Seen: cat": 0.95, "Seen: dog": 0.97})
-        picture = object()
-        settings = TagSettings(verify_statement="Seen: {TAG}", verify_threshold=0.9, thing_check="prompt")
+        image = object()
+        settings = TagSettings(verify_statement="Seen: {TAG}", verify_thresholds=LOW_PROPOSED, thing_check="prompt")
 
-        trace = tag_picture(clip, classifier, picture, settings=settings, known={})
+        trace = tag_image(clip, classifier, image, settings=settings, thing_cache={})
         assert classifier.noul_calls == [([presence_statement(tag, wording="Seen: {TAG}") for tag in ("cat", "dog")],
-                                          picture, "")]
+                                          image, "")]
         assert trace.kept == ("dog", "cat")
 
     def test_propose_stops_at_the_cap(self):
         clip = DecodingClip(words_of("cat, dog, fox, owl"))
         settings = TagSettings(propose_cap=2, merge_cap=2)
 
-        trace = tag_picture(clip, TaggingClassifier(), object(), settings=settings, known={})
+        trace = tag_image(clip, TaggingClassifier(), object(), settings=settings, thing_cache={})
         (text, _kwargs), = clip.tokenize_calls
         (_tokens, generate_kwargs), = clip.generate_calls
         assert text == chat(settings.propose_instruction, image=True)
@@ -1325,7 +1337,7 @@ class TestTagPicture:
         clip = ReplyingClip("objects, people, animals", "cat, dog")
         settings = TagSettings()
 
-        trace = tag_picture(clip, TaggingClassifier(), object(), settings=settings, known={})
+        trace = tag_image(clip, TaggingClassifier(), object(), settings=settings, thing_cache={})
         assert [text for text, _kwargs in clip.tokenize_calls] == [
             chat(settings.propose_instruction, image=True), chat(settings.echo_fallback_instruction, image=True)]
         assert trace.echo_reply == "objects, people, animals"
@@ -1336,7 +1348,8 @@ class TestTagPicture:
     def test_a_reply_holding_a_tag_is_not_proposed_again(self):
         clip = ReplyingClip("objects, cat")
 
-        trace = tag_picture(clip, TaggingClassifier(), object(), settings=TagSettings(verify_threshold=0.9), known={})
+        trace = tag_image(clip, TaggingClassifier(), object(), settings=TagSettings(verify_thresholds=LOW_PROPOSED),
+                          thing_cache={})
         assert len(clip.generate_calls) == 1
         assert trace.echo_reply is None
         assert trace.candidates == ("cat",)
@@ -1345,8 +1358,8 @@ class TestTagPicture:
     def test_no_fallback_wording_turns_the_fallback_off(self):
         clip = ReplyingClip("objects, people")
 
-        trace = tag_picture(clip, TaggingClassifier(), object(),
-                            settings=TagSettings(echo_fallback_instruction=None), known={})
+        trace = tag_image(clip, TaggingClassifier(), object(),
+                          settings=TagSettings(echo_fallback_instruction=None), thing_cache={})
         assert len(clip.generate_calls) == 1
         assert trace.echo_reply is None
         assert trace.candidates == ()
@@ -1354,25 +1367,28 @@ class TestTagPicture:
     def test_the_all_thing_check_drops_a_non_thing(self):
         clip = ReplyingClip("cat, sunset glow")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "sunset glow": 0.95, "dog": 0.99999}),
-                                       p_other={"sunset glow": 0.95})
-        known = {"dog": 0.1}
+                                       p_thing={"sunset glow": 0.05})
+        thing_cache = {"dog": 0.9}
 
-        trace = tag_picture(clip, classifier, object(), prompt_tags=("dog",), settings=TagSettings(thing_check="all", verify_threshold=0.9),
-                            known=known)
+        settings = TagSettings(thing_check="all", verify_thresholds=LOW_PROPOSED)
+
+        trace = tag_image(clip, classifier, object(), prompt_tags=("dog",), settings=settings, thing_cache=thing_cache)
         (request, _image), = classifier.classify_calls
         assert len(request.questions) == 2
         assert trace.candidates == ("cat", "dog")
         assert trace.origins == ("model", "prompt")
         assert trace.dropped == (("sunset glow", "not a thing"),)
         assert trace.kept == ("dog", "cat")
-        assert known == {"dog": 0.1, "cat": 0.0, "sunset glow": 0.95}
+        assert thing_cache == {"dog": 0.9, "cat": 1.0, "sunset glow": 0.05}
 
     def test_the_prompt_thing_check_leaves_the_candidates_alone(self):
         clip = ReplyingClip("cat, sunset glow")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "sunset glow": 0.95}),
-                                       p_other={"sunset glow": 0.95})
+                                       p_thing={"sunset glow": 0.05})
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", verify_threshold=0.9), known={})
+        settings = TagSettings(thing_check="prompt", verify_thresholds=LOW_PROPOSED)
+
+        trace = tag_image(clip, classifier, object(), settings=settings, thing_cache={})
         assert classifier.classify_calls == []
         assert trace.candidates == ("cat", "sunset glow")
         assert trace.dropped == ()
@@ -1383,8 +1399,9 @@ class TestTagPicture:
         classifier = TaggingClassifier(nouls=verify_nouls(
             {"cat": 0.9, "owl": 0.9, "bird": 0.89, "dog": 0.999, "fox": 0.9999}))
 
-        trace = tag_picture(clip, classifier, object(), prompt_tags=("owl", "dog", "fox"),
-                            settings=TagSettings(thing_check="prompt", verify_threshold=0.9), known={})
+        settings = TagSettings(thing_check="prompt", verify_thresholds=LOW_PROPOSED)
+
+        trace = tag_image(clip, classifier, object(), prompt_tags=("owl", "dog", "fox"), settings=settings, thing_cache={})
         assert trace.candidates == ("cat", "owl", "bird", "dog", "fox")
         assert trace.origins == ("model", "both", "model", "prompt", "prompt")
         assert trace.verified == ("cat", "owl", "fox")
@@ -1393,8 +1410,8 @@ class TestTagPicture:
         clip = ReplyingClip("cat, dog, cat ear")
         classifier = TaggingClassifier()
 
-        trace = tag_picture(clip, classifier, object(),
-                            settings=TagSettings(verify_statement="", thing_check="prompt", order="score"), known={})
+        trace = tag_image(clip, classifier, object(),
+                          settings=TagSettings(verify_statement="", thing_check="prompt", order="score"), thing_cache={})
         assert classifier.noul_calls == []
         assert trace.scores == (None, None, None)
         assert trace.verified == ("cat", "dog", "cat ear")
@@ -1402,14 +1419,15 @@ class TestTagPicture:
 
     @pytest.mark.parametrize(("order", "kept"), [
         ("score", ("owl", "bird", "cat", "dog")),
-        ("proposed", ("cat", "owl", "bird", "dog")),
+        ("candidate", ("cat", "owl", "bird", "dog")),
     ])
     def test_orders_the_kept_tags(self, order, kept):
         clip = ReplyingClip("cat, owl, bird, dog")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "owl": 0.99, "bird": 0.97, "dog": 0.95}))
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", order=order, verify_threshold=0.9),
-                            known={})
+        settings = TagSettings(thing_check="prompt", order=order, verify_thresholds=LOW_PROPOSED)
+
+        trace = tag_image(clip, classifier, object(), settings=settings, thing_cache={})
         assert trace.kept == kept
 
     @pytest.mark.parametrize(("rule", "kept"), [("words", ("cat ear",)), ("head-noun", ("cat ear", "cat"))])
@@ -1417,42 +1435,43 @@ class TestTagPicture:
         clip = ReplyingClip("cat, cat ear")
         classifier = TaggingClassifier(nouls=verify_nouls({"cat": 0.95, "cat ear": 0.99}))
 
-        trace = tag_picture(clip, classifier, object(), settings=TagSettings(thing_check="prompt", subsets_rule=rule, verify_threshold=0.9),
-                            known={})
+        settings = TagSettings(thing_check="prompt", subsets_rule=rule, verify_thresholds=LOW_PROPOSED)
+
+        trace = tag_image(clip, classifier, object(), settings=settings, thing_cache={})
         assert trace.verified == ("cat", "cat ear")
         assert trace.kept == kept
 
 
-class TestFitPicture:
+class TestFitImage:
     @pytest.fixture
     def torch(self):
         return pytest.importorskip("torch")
 
     def test_shrinks_to_the_cap_keeping_the_aspect(self, torch):
-        assert tuple(fit_picture(torch.rand(1, 400, 600, 3), 60_000).shape) == (1, 200, 300, 3)
+        assert tuple(fit_image(torch.rand(1, 400, 600, 3), 60_000).shape) == (1, 200, 300, 3)
 
     def test_takes_the_area_mean(self, torch):
         image = torch.tensor([[0.0, 1.0], [2.0, 3.0]]).reshape(1, 2, 2, 1).repeat(1, 1, 1, 3)
 
-        assert torch.equal(fit_picture(image, 1), torch.full((1, 1, 1, 3), 1.5))
+        assert torch.equal(fit_image(image, 1), torch.full((1, 1, 1, 3), 1.5))
 
     @pytest.mark.parametrize("max_pixels", [20_000, 1_000_000], ids=["at-the-cap", "below-the-cap"])
-    def test_leaves_a_picture_within_the_cap_unchanged(self, torch, max_pixels):
+    def test_leaves_an_image_within_the_cap_unchanged(self, torch, max_pixels):
         image = torch.rand(1, 100, 200, 3)
 
-        assert torch.equal(fit_picture(image, max_pixels), image)
+        assert torch.equal(fit_image(image, max_pixels), image)
 
     def test_keeps_the_first_three_channels(self, torch):
         image = torch.rand(1, 40, 40, 4)
 
-        assert torch.equal(fit_picture(image, 10_000), image[..., :3])
-        assert tuple(fit_picture(image, 400).shape) == (1, 20, 20, 3)
+        assert torch.equal(fit_image(image, 10_000), image[..., :3])
+        assert tuple(fit_image(image, 400).shape) == (1, 20, 20, 3)
 
     @pytest.mark.parametrize(("height", "width", "fitted"), [(1, 5000, (1, 100)), (5000, 1, (100, 1))],
                              ids=["wide", "tall"])
     def test_an_extreme_aspect_stays_within_the_cap(self, torch, height, width, fitted):
-        assert tuple(fit_picture(torch.rand(1, height, width, 3), 100).shape) == (1, *fitted, 3)
+        assert tuple(fit_image(torch.rand(1, height, width, 3), 100).shape) == (1, *fitted, 3)
 
     def test_rejects_a_cap_below_1(self, torch):
-        with pytest.raises(ValueError, match=r"fit_picture got max_pixels=0\. Use 1 or more"):
-            fit_picture(torch.rand(1, 2, 2, 3), 0)
+        with pytest.raises(ValueError, match=r"fit_image got max_pixels=0\. Use 1 or more"):
+            fit_image(torch.rand(1, 2, 2, 3), 0)

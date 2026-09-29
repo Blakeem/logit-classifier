@@ -355,43 +355,42 @@ stays beside "cat ear", and "signage" is dropped beside "signage in chinese".
 ### ComfyUI Tools
 
 These run inside a ComfyUI node over the CLIP the workflow loaded. Each one imports comfy and
-torch only when it is called.
+torch only when it is called. `logit_classifier.toolkit.comfyui` exports every tool. The table
+names the module of each tool it lists.
 
-| Tool | Does |
-|---|---|
-| `comfy_classifier` | builds a classifier over the CLIP, with errors that name the node and the Load CLIP fix |
-| `generate_text` | generates one greedy reply with the Qwen chat template, and stops early on a condition |
-| `shared_vision_encode` | runs the vision tower once per picture for every generate and classify inside the block |
-| `skip_resident_loads` | skips core's model load while the CLIP is already on the GPU |
-| `routed_progress_bars`, `send_status`, `run_outcome` | show one progress bar per run and a status line under the node |
-| `fit_picture` | downscales an image to a pixel cap |
-| `prompt_tags` | lists the physical things a prompt names |
-| `tag_picture` | tags a picture, with a prompt's things added as candidates |
-| `TagSettings` | holds every wording, budget, cap and threshold of the tagger |
+| Module | Tool | Does |
+|---|---|---|
+| `classifier` | `comfy_classifier` | builds a classifier over the CLIP, with errors that name the node and the Load CLIP fix |
+| `generate` | `generate_text` | generates one greedy reply with the Qwen chat template, and stops early on a condition |
+| `generate` | `clip_generate` | runs core's generate, then clears the CUDA graphs it captured |
+| `scopes` | `shared_vision_encode` | runs the vision tower once per image for every generate and classify inside the block |
+| `scopes` | `skip_resident_loads` | skips core's model load while the CLIP is already on the GPU |
+| `progress` | `routed_progress_bars`, `send_status`, `run_outcome` | show one progress bar per run and a status line under the node |
+| `tagger` | `fit_image` | downscales an image to a pixel cap |
+| `tagger` | `tag_prompt` | lists the physical things a prompt names |
+| `tagger` | `tag_image` | tags an image, with a prompt's things added as candidates |
+| `tagger` | `TagSettings` | holds every wording, budget, cap and threshold of the tagger |
 
 The tagger generates candidate tags over the CLIP and verifies each one with the classifier.
 
 ```python
-from logit_classifier.toolkit.comfyui import TagSettings, comfy_classifier, fit_picture, tag_picture
+from logit_classifier.toolkit.comfyui import TagSettings, comfy_classifier, fit_image, tag_image
 
 classifier = comfy_classifier(clip, node="My Tagger")
-picture = fit_picture(image, 1024 * 1024)
-trace = tag_picture(clip, classifier, picture, settings=TagSettings(), known={})
+trace = tag_image(clip, classifier, fit_image(image, 1024 * 1024), settings=TagSettings(), thing_cache={})
 tags = trace.kept
 ```
 
-`known` holds the thing check's answers across a run, so each tag is asked once. The
+`thing_cache` holds the thing check's answers across a run, so each tag is asked once. The
 `TagSettings` defaults are the current measured values, and a later release may change them.
 Pass every value your output depends on to keep it fixed.
 
-For fewer wrong tags, pass `STRICT_THRESHOLDS.proposed` as `verify_threshold` and
-`STRICT_THRESHOLDS.declared` as `prompt_only_threshold`.
+For fewer wrong tags, pass `STRICT_THRESHOLDS` as `verify_thresholds`.
 
 ```python
 from logit_classifier.toolkit.tags import STRICT_THRESHOLDS
 
-settings = TagSettings(verify_threshold=STRICT_THRESHOLDS.proposed,
-                       prompt_only_threshold=STRICT_THRESHOLDS.declared)
+settings = TagSettings(verify_thresholds=STRICT_THRESHOLDS)
 ```
 
 ## Differences From Jev

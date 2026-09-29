@@ -18,6 +18,7 @@ from ..tags import (
     BROAD_THRESHOLDS,
     PRESENCE_STATEMENT,
     MergedCandidates,
+    PresenceThresholds,
     drop_subsets,
     in_prompt,
     merge_candidates,
@@ -34,7 +35,7 @@ _PROMPT = "{PROMPT}"
 _TAG = "{TAG}"
 _THING_CHECKS = ("all", "prompt")
 _SUBSETS_RULES = ("words", "head-noun")
-_ORDERS = ("score", "proposed")
+_ORDERS = ("score", "candidate")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -64,7 +65,7 @@ class TagSettings:
     # On fp8, 40 over 25 added 0.85 correct and 0.15 wrong or vague tags per render, and 0.87 and 0.10 per tile
     # (the Logit Tagger's tests-AB/ab_tagger_score.py --replay, ContextAnchoredTileRefine tests-AB/ab_tags_bench.py).
     propose_cap: int = 25
-    # The model's 25 and a long prompt's about 40 tags, in one packed verify pass beside a 1 MP picture
+    # The model's 25 and a long prompt's about 40 tags, in one packed verify pass beside a 1 MP image
     # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md, section 7).
     merge_cap: int = 64
     # The propose wording's own nouns came back as tags and passed verify (ContextAnchoredTileRefine
@@ -102,20 +103,17 @@ class TagSettings:
                   "shape or form, lighting in general, a camera or render effect, a style, a mood, a "
                   "quality or an idea"),
     )
-    # Mid scores mix things with non-things ("robots" 0.85 on fp8), so only a confident "other" drops a tag.
-    thing_threshold: float = 0.9
+    # Low p("thing") scores mix things with non-things ("robots" 0.15 on fp8), so only a score below 0.1 drops a tag.
+    thing_threshold: float = 0.1
     # Judging only the prompt's tags kept "watermark" and "pixel art", and added 0.28 vague tags per render and 0.81
     # per tile on fp8 (ab_tagger_score.py --replay, ab_tags_bench.py).
     thing_check: str = "all"
 
     # The toolkit's presence wording (toolkit/tags.py), which the Logit Tagger asks of a listed tag and a prompt's thing.
     verify_statement: str = PRESENCE_STATEMENT
-    # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 2.6 to 4.0 correct ones on renders, photos and tiles,
-    # and 0.9999 cost about 50 correct tile tags per further one (ab_tagger_score.py --replay, ab_tags_bench.py).
-    verify_threshold: float = BROAD_THRESHOLDS.proposed
-    # A near name passes 0.9, and 0.9999 cut wrong tags per tile from 0.83 to 0.29 on the hold-out tiles
-    # (ContextAnchoredTileRefine tests-AB/tags-bench-log.md, sections 8 and 10).
-    prompt_only_threshold: float = BROAD_THRESHOLDS.declared
+    # On fp8, 0.999 over 0.9 removed a wrong or vague tag per 2.6 to 4.0 correct ones, and 0.9999 on a declared tag cut
+    # wrong tags per tile from 0.83 to 0.29 (ab_tagger_score.py --replay, ContextAnchoredTileRefine tags-bench-log.md).
+    verify_thresholds: PresenceThresholds = BROAD_THRESHOLDS
 
     # The "head-noun" rule keeps "cat" beside "cat ear", and also "stone" beside "stone walls" and "castle" beside
     # "stone castle tower". On fp8 tiles it added 0.03 wrong or vague tags per tile (ab_tags_bench.py).
@@ -128,12 +126,7 @@ class TagSettings:
             ("translate_instruction", self.translate_instruction, _PROMPT),
             ("thing_question", self.thing_question, _TAG),
         ]
-        thresholds = {
-            "english_threshold": self.english_threshold,
-            "thing_threshold": self.thing_threshold,
-            "verify_threshold": self.verify_threshold,
-            "prompt_only_threshold": self.prompt_only_threshold,
-        }
+        thresholds: dict[str, float] = {}
         budgets = {
             "propose_max_tokens": self.propose_max_tokens,
             "propose_cap": self.propose_cap,
@@ -148,6 +141,15 @@ class TagSettings:
         }
         criteria_keys = {key for key, _text in self.thing_criteria}
 
+        if not isinstance(self.verify_thresholds, PresenceThresholds):
+            raise ValueError(f"TagSettings got verify_thresholds={self.verify_thresholds!r}. Use a PresenceThresholds, "
+                             f"such as BROAD_THRESHOLDS or STRICT_THRESHOLDS from logit_classifier.toolkit.tags.")
+        thresholds = {
+            "english_threshold": self.english_threshold,
+            "thing_threshold": self.thing_threshold,
+            "verify_thresholds.proposed": self.verify_thresholds.proposed,
+            "verify_thresholds.declared": self.verify_thresholds.declared,
+        }
         # An empty verify statement turns verify off, so it needs no placeholder.
         if self.verify_statement:
             wordings.append(("verify_statement", self.verify_statement, _TAG))
@@ -176,23 +178,23 @@ class TagSettings:
 
 
 @dataclass(frozen=True, kw_only=True)
-class PromptTags:
-    """One prompt's listing, for the pack to merge into every picture's candidates.
+class PromptTagTrace:
+    """One prompt's pass through tag_prompt, whose tags the pack merges into every image's candidates.
 
-    text is the English text the listing read. listed holds the tags in_prompt keeps, p_other each one's thing check
+    text is the English text the listing read. listed holds the tags in_prompt keeps, p_thing each one's thing check
     score, and tags the listed tags the thing check keeps.
     """
 
     text: str
     reply: str
     listed: tuple[str, ...]
-    p_other: tuple[float, ...]
+    p_thing: tuple[float, ...]
     tags: tuple[str, ...]
 
 
 @dataclass(frozen=True, kw_only=True)
-class TagTrace:
-    """One picture's pass through every stage.
+class ImageTagTrace:
+    """One image's pass through tag_image.
 
     echo_reply holds the replaced reply when the echo fallback ran. dropped holds (name, reason) pairs from the merge
     and the thing check. scores holds None per candidate with verify off. verified is before drop_subsets, and kept
@@ -212,7 +214,7 @@ class TagTrace:
     verify_ms: float
 
 
-def fit_picture(image: Any, max_pixels: int) -> Any:
+def fit_image(image: Any, max_pixels: int) -> Any:
     """Return the first three channels of a [B, H, W, C] image, area-downscaled to at most max_pixels, never upscaled.
 
     Core resizes a vision image only above 12.8 MP, so a 4k input would cost about 12k vision tokens.
@@ -226,7 +228,7 @@ def fit_picture(image: Any, max_pixels: int) -> Any:
     fitted_width = 0
 
     if max_pixels < 1:
-        raise ValueError(f"fit_picture got max_pixels={max_pixels!r}. Use 1 or more.")
+        raise ValueError(f"fit_image got max_pixels={max_pixels!r}. Use 1 or more.")
     if height * width <= max_pixels:
         return rgb
     scale = math.sqrt(max_pixels / (height * width))
@@ -239,13 +241,13 @@ def fit_picture(image: Any, max_pixels: int) -> Any:
 
 
 def thing_scores(
-    classifier: Classifier, tags: Sequence[str], settings: TagSettings, known: dict[str, float]
+    classifier: Classifier, tags: Sequence[str], settings: TagSettings, thing_cache: dict[str, float]
 ) -> tuple[float, ...]:
-    """Return the thing check's p("other") per tag, asking every tag missing from known in one text-only request.
+    """Return the thing check's p("thing") per tag, asking every tag missing from thing_cache in one text-only request.
 
-    known carries the answers across a run, so each tag is asked once per known.
+    thing_cache carries the answers across a run, so each tag is asked once per cache.
     """
-    unknown = tuple(dict.fromkeys(tag for tag in tags if tag not in known))
+    unknown = tuple(dict.fromkeys(tag for tag in tags if tag not in thing_cache))
     criteria: dict[str, JSONContent | None] = dict(settings.thing_criteria)
     questions: dict[str, Question] = {}
 
@@ -259,11 +261,11 @@ def thing_scores(
             answer = response.answers[qid]
             if not isinstance(answer, ChoiceAnswer):
                 raise TypeError(f"thing question {qid} got a {answer.type} answer, not a choice")
-            known[tag] = answer.probabilities["other"]
-    return tuple(known[tag] for tag in tags)
+            thing_cache[tag] = answer.probabilities["thing"]
+    return tuple(thing_cache[tag] for tag in tags)
 
 
-def english_text(clip: Any, classifier: Classifier, prompt: str, settings: TagSettings) -> str:
+def to_english(clip: Any, classifier: Classifier, prompt: str, settings: TagSettings) -> str:
     """Return the prompt when the language gate is off or reads it as English, otherwise its English translation.
 
     A blank translation gives the prompt back.
@@ -280,9 +282,9 @@ def english_text(clip: Any, classifier: Classifier, prompt: str, settings: TagSe
     return translation or prompt
 
 
-def prompt_tags(
-    clip: Any, classifier: Classifier, prompt: str, settings: TagSettings, known: dict[str, float]
-) -> PromptTags:
+def tag_prompt(
+    clip: Any, classifier: Classifier, prompt: str, settings: TagSettings, thing_cache: dict[str, float]
+) -> PromptTagTrace:
     """List the physical things the prompt names that its English text grounds and the thing check keeps.
 
     The listing reads the prompt's English text, since in_prompt and the streak stop match the text's own words.
@@ -291,33 +293,34 @@ def prompt_tags(
     word_forms: frozenset[str] = frozenset()
     reply = ""
     listed: tuple[str, ...] = ()
-    p_other: tuple[float, ...] = ()
+    p_thing: tuple[float, ...] = ()
 
     if not prompt.strip():
-        return PromptTags(text="", reply="", listed=(), p_other=(), tags=())
-    text = english_text(clip, classifier, prompt, settings)
+        return PromptTagTrace(text="", reply="", listed=(), p_thing=(), tags=())
+    text = to_english(clip, classifier, prompt, settings)
     word_forms = prompt_word_forms(text)
     reply = generate_text(clip, settings.prompt_tags_instruction.replace(_PROMPT, text),
                           max_tokens=settings.prompt_tags_max_tokens,
                           should_stop=tag_stop(max_tags=None, ungrounded_streak=settings.ungrounded_streak,
                                                word_forms=word_forms))
     listed = tuple(tag for tag in parse_candidates(reply) if in_prompt(tag, word_forms))
-    p_other = thing_scores(classifier, listed, settings, known)
-    return PromptTags(text=text, reply=reply, listed=listed, p_other=p_other,
-                      tags=tuple(tag for tag, p in zip(listed, p_other, strict=True) if p < settings.thing_threshold))
+    p_thing = thing_scores(classifier, listed, settings, thing_cache)
+    return PromptTagTrace(text=text, reply=reply, listed=listed, p_thing=p_thing,
+                          tags=tuple(tag for tag, p in zip(listed, p_thing, strict=True)
+                                     if p >= settings.thing_threshold))
 
 
-def _propose(clip: Any, picture: Any, instruction: str, settings: TagSettings) -> tuple[str, tuple[str, ...]]:
-    reply = generate_text(clip, instruction, image=picture, max_tokens=settings.propose_max_tokens,
+def _propose(clip: Any, image: Any, instruction: str, settings: TagSettings) -> tuple[str, tuple[str, ...]]:
+    reply = generate_text(clip, instruction, image=image, max_tokens=settings.propose_max_tokens,
                           should_stop=tag_stop(max_tags=settings.propose_cap, ungrounded_streak=0))
 
     return reply, tuple(parse_candidates(reply, max_candidates=settings.propose_cap))
 
 
 def _things_only(classifier: Classifier, merged: MergedCandidates, settings: TagSettings,
-                 known: dict[str, float]) -> MergedCandidates:
-    p_other = thing_scores(classifier, merged.candidates, settings, known)
-    is_thing = [p < settings.thing_threshold for p in p_other]
+                 thing_cache: dict[str, float]) -> MergedCandidates:
+    p_thing = thing_scores(classifier, merged.candidates, settings, thing_cache)
+    is_thing = [p >= settings.thing_threshold for p in p_thing]
     not_things = tuple((tag, "not a thing") for tag, thing in zip(merged.candidates, is_thing, strict=True)
                        if not thing)
 
@@ -325,24 +328,24 @@ def _things_only(classifier: Classifier, merged: MergedCandidates, settings: Tag
                             tuple(itertools.compress(merged.origins, is_thing)), merged.dropped + not_things)
 
 
-def tag_picture(
+def tag_image(
     clip: Any,
     classifier: Classifier,
-    picture: Any,
+    image: Any,
     *,
     prompt_tags: Sequence[str] = (),
     settings: TagSettings,
-    known: dict[str, float],
+    thing_cache: dict[str, float],
     on_stage: Callable[[str], None] | None = None,
-) -> TagTrace:
-    """Propose, merge with prompt_tags, check, verify and clean the tags of a picture the caller already fitted.
+) -> ImageTagTrace:
+    """Propose, merge with prompt_tags, check, verify and clean the tags of an image the caller already fitted.
 
-    Propose and verify run in one shared_vision_encode scope, so the vision tower encodes the picture once. on_stage
+    Propose and verify run in one shared_vision_encode scope, so the vision tower encodes the image once. on_stage
     hears "propose", then "verify".
     """
     announce = on_stage if on_stage is not None else (lambda _stage: None)
-    thresholds = {"model": settings.verify_threshold, "both": settings.verify_threshold,
-                  "prompt": settings.prompt_only_threshold}
+    thresholds = {"model": settings.verify_thresholds.proposed, "both": settings.verify_thresholds.proposed,
+                  "prompt": settings.verify_thresholds.declared}
     reply = ""
     echo_reply: str | None = None
     proposed: tuple[str, ...] = ()
@@ -359,22 +362,22 @@ def tag_picture(
     with shared_vision_encode(clip):
         announce("propose")
         started = time.perf_counter()
-        reply, proposed = _propose(clip, picture, settings.propose_instruction, settings)
+        reply, proposed = _propose(clip, image, settings.propose_instruction, settings)
         if (settings.echo_fallback_instruction is not None
                 and not merge_candidates(proposed, (), cap=settings.merge_cap,
                                          drop=settings.category_nouns).candidates):
             echo_reply = reply
-            reply, proposed = _propose(clip, picture, settings.echo_fallback_instruction, settings)
+            reply, proposed = _propose(clip, image, settings.echo_fallback_instruction, settings)
         propose_ms = (time.perf_counter() - started) * 1000.0
         merged = merge_candidates(proposed, prompt_tags, cap=settings.merge_cap, drop=settings.category_nouns)
         if settings.thing_check == "all":
-            merged = _things_only(classifier, merged, settings, known)
+            merged = _things_only(classifier, merged, settings, thing_cache)
         announce("verify")
         started = time.perf_counter()
         if settings.verify_statement:
             verify_scores = tuple(classifier.nouls(
                 [presence_statement(tag, wording=settings.verify_statement) for tag in merged.candidates],
-                image=picture))
+                image=image))
             verified = passed_by_origin(merged.candidates, merged.origins, verify_scores, thresholds=thresholds)
             scores = verify_scores
         else:
@@ -387,6 +390,6 @@ def tag_picture(
         score_of = dict(zip(merged.candidates, verify_scores, strict=True))
         # sorted is stable, so tied tags keep candidate order.
         kept = tuple(sorted(kept, key=score_of.__getitem__, reverse=True))
-    return TagTrace(reply=reply, echo_reply=echo_reply, proposed=proposed, candidates=merged.candidates,
-                    origins=merged.origins, dropped=merged.dropped, scores=scores, verified=verified, kept=kept,
-                    propose_ms=propose_ms, verify_ms=verify_ms)
+    return ImageTagTrace(reply=reply, echo_reply=echo_reply, proposed=proposed, candidates=merged.candidates,
+                         origins=merged.origins, dropped=merged.dropped, scores=scores, verified=verified, kept=kept,
+                         propose_ms=propose_ms, verify_ms=verify_ms)
