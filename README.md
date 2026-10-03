@@ -240,7 +240,8 @@ Two corrections are applied before the softmax.
 
 The label prior is the model's standing preference for the token `A` over `B`. It is
 learned as a running mean over served requests, so it needs no labelled data or extra
-forward passes. It stays unused until a bucket has 32 observations, so the first requests
+forward passes. It corrects choice questions only, since the letters of a noul and a score
+always name the same answers. It stays unused until a bucket has 32 observations, so the first requests
 after a cold start can answer a little differently from later ones.
 
 The temperature is fitted per model and divides the logits. Both shipped values were

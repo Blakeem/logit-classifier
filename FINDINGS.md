@@ -56,9 +56,10 @@ options, but that is the split path defect below, not a gain. `ab_temperature.py
 ## The prior corrects letters, not fixed positions
 
 The running prior subtracts the model's standing preference for one letter over another.
-Two positions carry a fixed meaning instead. The escape label always means none of these,
-and a score's letters always name the same rungs. Their mean mass follows the traffic, so
-correcting them moves one request's answer with unrelated requests.
+Some positions carry a fixed meaning instead. The escape label always means none of these,
+a score's letters always name the same rungs, and a noul's `A` is always yes. Their mean mass
+follows the traffic, so correcting them moves one request's answer with unrelated requests.
+The prior therefore covers the lettered options of choice and member branches only.
 
 Banking77, 462 held out rows, Qwen3-VL-4B-Instruct at its fitted temperature.
 
@@ -71,6 +72,28 @@ Banking77, 462 held out rows, Qwen3-VL-4B-Instruct at its fitted temperature.
 The fix does not regress calibration. The accuracy gain is four rows in 462, near the noise
 of this sample. The prior still costs calibration against no prior, because the shipped
 temperature was fitted with the prior off. `banking77.py`, with and without `--no-prior`.
+
+A noul under the prior shows the same coupling. Banking77 statements ("This message is about
+<intent>", true for the row's own intent) ran as request streams at four true rates, the first
+32 requests of each stream unscored.
+
+| Stream | Prior | AUC | Recall at 0.5 | False positives at 0.5 | Recall at 0.9999 |
+|---|---|---|---|---|---|
+| 50% true | off | 0.9538 | 0.891 | 0.065 | 0.050 |
+| 50% true | on | 0.9531 | 0.891 | 0.065 | 0.059 |
+| 80% true | off | 0.9419 | 0.872 | 0.091 | 0.055 |
+| 80% true | on | 0.9410 | 0.848 | 0.068 | 0.006 |
+| 95% true | off | 0.9428 | 0.878 | 0.083 | 0.056 |
+| 95% true | on | 0.9409 | 0.821 | 0.000 | 0.005 |
+| 20% true | off | 0.9439 | 0.878 | 0.078 | 0.000 |
+| 20% true | on | 0.9435 | 0.878 | 0.102 | 0.122 |
+
+The AUC does not move, since the correction is one shift of the yes/no gap. The operating point
+moves with the traffic instead. A request took 126.6 ms with the prior off and 126.4 ms with it
+on, so the prior has no speed cost or gain. ContextAnchoredTileRefine's tags bench (45 judged
+tiles) kept 8.2 correct tags per tile with the prior off and 5.4 with it on. Its first tile
+matched, and the loss grew over the later tiles, which the earlier tiles' mostly true verify
+answers had trained. `ab_prior_traffic.py`.
 
 ## Option order helps above 52 options and nowhere else
 
@@ -382,7 +405,8 @@ wording.
 | image source detected by string length | an 8x8 PNG encodes shorter than the threshold and was read as a path | check whether the file exists |
 | M-RoPE offset dropped on branch rows | Qwen3-VL raises rather than misplacing tokens | read `rope_deltas` after the prefix pass |
 | prior learned and corrected the escape label | traffic that often declines taught the prior to undo a decline | prior over the lettered options only |
-| a joint score shared a prior bucket with a choice of the same width | a score's top rung learned the choice traffic's escape mass | score has its own bucket |
+| a joint score shared a prior bucket with a choice of the same width | a score's top rung learned the choice traffic's escape mass | no prior on a score |
+| the yes/no and score layouts learned the traffic's answer rate | mostly true traffic cut recall at 0.9999 from 0.055 to 0.006 | prior over choice and member branches only |
 
 ## Known weaknesses
 

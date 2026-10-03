@@ -48,14 +48,12 @@ from .scoring import (
 from .vision import IMAGE_ONLY_STATE, extract_image, image_key
 
 # The label prior is a property of the token and how many labels compete, so
-# branches sharing a shape share a bucket. A score's letter names a fixed rung, so a
-# score never shares a bucket with a choice of the same width.
+# branches sharing a shape share a bucket. A noul's or score's letters always name the same
+# answers, so their mean mass is the traffic's answer rate rather than letter bias, and those
+# kinds get no prior (tests-AB/ab_prior_traffic.py).
 _PRIOR_KIND = {
     "choice": "choice",
     "member": "choice",
-    "score_level": "binary",
-    "score_joint": "score",
-    "noul": "binary",
 }
 
 
@@ -153,7 +151,7 @@ class Classifier:
 
     def _calibrated(self, branch: Branch, logits: BranchLogits) -> tuple[np.ndarray, bool]:
         """Raw distribution feeds the prior estimate, calibrated one is returned."""
-        kind = _PRIOR_KIND[branch.kind]
+        kind = _PRIOR_KIND.get(branch.kind)
         # The escape label means "none of these" wherever it sits, so its mass is content
         # rather than letter bias, and only the lettered options get a prior.
         lettered = branch.label_count - 1 if branch.kind == "member" else branch.label_count
@@ -162,7 +160,7 @@ class Classifier:
 
         # One switch turns learning, application and persistence off together, so a host
         # that asked for no debias gets the same numbers on every call.
-        if self.config.use_prior_debias:
+        if self.config.use_prior_debias and kind is not None:
             self.priors.observe(kind, restricted_softmax(logits.z[:lettered]))
             letters_prior = self.priors.log_prior(kind, lettered)
         if letters_prior is not None:

@@ -1239,11 +1239,23 @@ class TestPriorBuckets:
 
         return BranchLogits(z=np.array(z, dtype=np.float64), candidate_mass=1.0)
 
-    def test_a_score_never_shares_a_bucket_with_a_choice_of_the_same_width(self):
+    @pytest.mark.parametrize(("kind", "label_count"), [("noul", 2), ("score_level", 2), ("score_joint", 5)])
+    def test_a_noul_or_score_is_neither_learned_nor_corrected(self, kind, label_count):
+        # Mostly true traffic taught the yes/no bucket to push every later answer toward no.
         classifier = self._classifier()
-        classifier._calibrated(self._branch("score_joint", 5), self._logits([4.0, 0, 0, 0, 0]))
+        branch = self._branch(kind, label_count)
+        z = [4.0] + [0.0] * (label_count - 1)
+        for _ in range(3):
+            classifier._calibrated(branch, self._logits(z))
+        calibrated, applied = classifier._calibrated(branch, self._logits(z))
+        assert not applied
+        assert classifier.priors.stats() == {}
+        assert calibrated == pytest.approx(restricted_softmax(np.array(z), None, classifier.temperature))
+
+    def test_a_choice_still_learns_its_letter_prior(self):
+        classifier = self._classifier()
         classifier._calibrated(self._branch("choice", 5), self._logits([0, 0, 0, 0, 4.0]))
-        assert classifier.priors.stats() == {"score:5": 1, "choice:5": 1}
+        assert classifier.priors.stats() == {"choice:5": 1}
 
     def test_the_escape_label_is_neither_learned_nor_corrected(self):
         classifier = self._classifier()
