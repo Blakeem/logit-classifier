@@ -12,10 +12,8 @@ from typing import ClassVar
 import pytest
 
 from logit_classifier import ChoiceAnswer, NoulAnswer, UnsupportedModelError, VisionUnsupportedError
-from logit_classifier import tags as legacy_tags
 from logit_classifier.backends import comfy_clip
 from logit_classifier.toolkit import comfyui
-from logit_classifier.toolkit import tags as toolkit_tags
 from logit_classifier.toolkit.comfyui import (
     IMAGE_SLOT,
     PromptTagTrace,
@@ -335,19 +333,6 @@ class TestHeadNoun:
     ])
     def test_a_phrase_with_no_word_before_a_break_gives_its_text(self, phrase, head):
         assert head_noun(phrase) == head
-
-
-class TestCompatibilityPath:
-    def test_lists_the_names_0_2_1_published(self):
-        assert set(legacy_tags.__all__) == {
-            "MAX_CANDIDATES", "MAX_TAG_WORDS", "MAX_TAG_CHARS", "MAX_REPEAT_BLOCK", "clean_item",
-            "parse_candidates", "drop_unfinished_tag", "complete_tags", "repeated_block", "split_prompt",
-            "normalize_item", "drop_subsets",
-        }
-
-    def test_every_listed_name_is_the_toolkit_object(self):
-        for name in legacy_tags.__all__:
-            assert getattr(legacy_tags, name) is getattr(toolkit_tags, name), name
 
 
 class TestInPrompt:

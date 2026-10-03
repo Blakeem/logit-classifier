@@ -936,13 +936,12 @@ def _imports_the_toolkit(path: Path, source: Path) -> bool:
 class TestCoreIsolation:
     SOURCE = Path(__file__).resolve().parents[1] / "src" / "logit_classifier"
 
-    @pytest.mark.parametrize("tags_module", ["logit_classifier.tags", "logit_classifier.toolkit.tags"])
-    def test_importing_the_package_loads_no_host(self, tags_module):
+    def test_importing_the_package_loads_no_host(self):
         # Prime directive 4. A ComfyUI pack imports this package beside ComfyUI's own
         # pinned CUDA build, so a stray top-level torch import would be a hard break.
         # A subprocess is the only honest check, since pytest has already imported PIL.
         probe = (
-            f"import sys; import logit_classifier; import {tags_module}; "
+            "import sys; import logit_classifier; import logit_classifier.toolkit.tags; "
             "print([m for m in ('torch', 'transformers', 'fastapi', 'PIL') if m in sys.modules])"
         )
         result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
@@ -962,14 +961,12 @@ class TestCoreIsolation:
 
     def test_no_core_module_imports_the_toolkit(self):
         # A lazy import inside a function escapes the subprocess probe, so every import statement is read.
-        compat = self.SOURCE / "tags.py"
         core_files = [
             path for path in sorted(self.SOURCE.rglob("*.py"))
-            if path.relative_to(self.SOURCE).parts[0] != "toolkit" and path != compat
+            if path.relative_to(self.SOURCE).parts[0] != "toolkit"
         ]
 
         assert self.SOURCE / "classifier.py" in core_files
-        assert _imports_the_toolkit(compat, self.SOURCE)
         assert [path.name for path in core_files if _imports_the_toolkit(path, self.SOURCE)] == []
 
 
