@@ -1135,6 +1135,55 @@ class TestDeterminismWindow:
         assert every == covered, f"{len(every - covered)} forward pass(es) sit outside the window"
 
 
+class TestExpandedAttention:
+    """The pinned memory efficient kernel rejects grouped heads, so none may reach it."""
+
+    @pytest.fixture
+    def torch_and_hf(self):
+        pytest.importorskip("transformers")
+        torch = pytest.importorskip("torch")
+        from logit_classifier.backends import hf
+
+        return torch, hf
+
+    # The prefix pass sends no mask and the branch pass sends one, and transformers
+    # expands grouped heads itself only in the second case.
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_the_kernel_sees_equal_heads_and_the_same_result(self, torch_and_hf, monkeypatch, masked):
+        torch, hf = torch_and_hf
+        from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+        generator = torch.Generator().manual_seed(0)
+        module = SimpleNamespace(num_key_value_groups=4, is_causal=True)
+        query = torch.randn(1, 8, 6, 16, generator=generator)
+        key = torch.randn(1, 2, 6, 16, generator=generator)
+        value = torch.randn(1, 2, 6, 16, generator=generator)
+        mask = torch.zeros(1, 1, 6, 6) if masked else None
+        expected, _ = sdpa_attention_forward(module, query, key, value, mask)
+
+        heads = []
+        original = torch.nn.functional.scaled_dot_product_attention
+
+        def recording(query, key, value, **kwargs):
+            heads.append((query.shape[1], key.shape[1], value.shape[1]))
+            return original(query, key, value, **kwargs)
+
+        monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recording)
+        output, _ = hf._expanded_sdpa_attention(module, query, key, value, mask)
+
+        assert heads == [(8, 8, 8)]
+        torch.testing.assert_close(output, expected)
+
+    def test_the_attention_name_carries_a_mask_builder(self, torch_and_hf):
+        # transformers builds no mask for a name it does not know, so a left padded
+        # branch row would attend to its own padding with no error raised.
+        _, hf = torch_and_hf
+        from transformers import AttentionInterface, AttentionMaskInterface
+
+        assert hf.ATTENTION_IMPLEMENTATION in AttentionInterface._global_mapping
+        assert hf.ATTENTION_IMPLEMENTATION in AttentionMaskInterface._global_mapping
+
+
 class TestPriorBuckets:
     """The prior corrects letter bias only, so fixed-meaning positions stay out of it."""
 
@@ -1370,6 +1419,24 @@ class TestModelLoading:
         for call in calls:
             keywords = {keyword.arg for keyword in call.keywords}
             assert "cache_dir" in keywords, f"from_pretrained at line {call.lineno} has no cache_dir"
+
+    def test_every_model_loads_the_expanded_attention(self):
+        # A model loaded under plain sdpa sends grouped heads, which the pinned kernel rejects.
+        tree = ast.parse(self.HF_SOURCE.read_text(encoding="utf-8"))
+        loads = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "from_pretrained"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id.startswith("AutoModel")
+        ]
+        assert loads, "no model load found, the check would pass vacuously"
+        for call in loads:
+            keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+            implementation = keywords.get("attn_implementation")
+            assert isinstance(implementation, ast.Name), f"model load at line {call.lineno} keeps plain sdpa"
+            assert implementation.id == "ATTENTION_IMPLEMENTATION"
 
 
 class TestModelsDirEnv:

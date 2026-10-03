@@ -160,7 +160,7 @@ the CUDA attention path, only one of them changes a logit on either shipped mode
 |---|---|---|
 | `cudnn.benchmark` | 0.0 | 0.0 |
 | `cudnn.deterministic` | 0.0 | 0.0 |
-| `allow_bf16_reduced_precision_reduction` | **0.5** | **0.75** |
+| `allow_bf16_reduced_precision_reduction` | **0.375** | **1.125** |
 | float32 matmul precision | 0.0 | 0.0 |
 
 Max absolute logit shift against the fully pinned run, window removed so the process
@@ -256,27 +256,28 @@ most room before two near-equal wide branches are split apart.
 
 ## Throughput and where it falls off
 
-Warm model, RTX 3090 Ti. Adding questions to a record is close to free up to about 8,
-because the fixed cost of two forward passes dominates a short record.
+Warm model, RTX 3090 Ti. Each row repeats one request, so its sequence lengths are already
+seen. Adding questions to a record is close to free up to about 8, because the fixed cost of
+two forward passes dominates a short record.
 
 | Questions per record | Total ms | ms per tag | Records per hour |
 |---|---|---|---|
-| 1 | 138 | 138 | 26,100 |
-| 4 | 136 | 34 | 26,500 |
-| 8 | 140 | 17.5 | 25,800 |
-| 32 | 278 | 8.7 | 13,000 |
+| 1 | 149 | 149 | 24,200 |
+| 4 | 148 | 37 | 24,300 |
+| 8 | 146 | 18.2 | 24,700 |
+| 32 | 280 | 8.8 | 12,800 |
 
 The state is prefilled once per record, so a longer record costs more.
 
 | State tokens | Total ms, 8 questions | ms per tag | Records per hour |
 |---|---|---|---|
-| 172 | 140 | 17.5 | 25,700 |
-| 556 | 185 | 23 | 19,500 |
-| 2,092 | 451 | 56 | 8,000 |
-| 8,236 | 1,575 | 197 | 2,300 |
-| 32,812 | 41,515 | 5,189 | 87 |
+| 172 | 146 | 18.3 | 24,600 |
+| 556 | 184 | 23 | 19,600 |
+| 2,092 | 452 | 57 | 8,000 |
+| 8,236 | 1,742 | 218 | 2,100 |
+| 32,812 | 155,903 | 19,488 | 23 |
 
-Prefill runs at 46 to 48 TFLOP/s from about 2,000 tokens up, near this card's practical
+Prefill runs at 43 to 46 TFLOP/s from about 2,000 tokens up, near this card's practical
 BF16 ceiling. Below that the time is almost all kernel launch rather than arithmetic, so a
 428 token request spends 0.14 ms on the math. The last row falls off the ceiling for the
 reason under Known weaknesses. `benchmark.py`.
@@ -294,6 +295,32 @@ dispatcher reaches the math backend, which builds the full attention matrix. Mea
 
 `HFBackend` probes the backends at startup, at the model's own dtype, and pins the working
 ones. `benchmark.py`.
+
+## The memory efficient kernel, not cuDNN
+
+cuDNN builds an execution plan the first time it sees a sequence length, and served requests
+rarely repeat a length. The memory efficient kernel has no such cost, but it rejects grouped
+key and value heads. transformers passes grouped heads whenever a pass has no mask, which is
+the prefix pass. So the model loads under its own attention name, which expands the heads
+before the kernel sees them.
+
+Both arms ran on one loaded model.
+
+| | cuDNN, grouped heads | memory efficient, expanded heads |
+|---|---|---|
+| 40 requests of unseen length, 96 to 2,865 tokens, p50 | 1,501 ms | 335 ms |
+| the same 40 requests repeated, p50 | 335 ms | 327 ms |
+| image request of unseen length, 132 image tokens | 2,257 ms | 214 ms |
+| 8,192 token state and 8 questions, unseen | 3,664 ms | 1,927 ms |
+| 8,192 token state and 8 questions, repeated | 1,672 ms | 1,742 ms |
+| peak memory at 8,192 tokens | 15.76 GB | 15.76 GB |
+| Banking77, 462 held out rows, accuracy | 0.6255 | 0.6212 |
+| Banking77, 462 held out rows, ECE at T=1.25 | 0.0882 | 0.0834 |
+
+The two kernels round differently in bfloat16. Logits moved by a median of 0.25 and at most
+1.5, and the top letter changed on 36 of 924 rows. Accuracy moved by 2 of 462 held out rows,
+which is inside the noise of that sample, so the fitted temperature stands. The same request
+still returns bitwise equal logits on 924 of 924 rows. `ab_attention_kernel.py`.
 
 ## One presence wording, two threshold pairs
 
@@ -326,7 +353,8 @@ wording.
 |---|---|---|
 | score used the choice confidence formula | wrong confidence on every score answer | ported both official formulas |
 | attention probe ran in bfloat16 whatever the model dtype | any other dtype crashed on the first forward | probe at the model's dtype |
-| attention probe used one call shape | approved a backend that then failed | probe causal and masked, with grouped query attention |
+| attention probe used one call shape | approved a backend that then failed | probe the causal and masked forms the forward sends |
+| cuDNN attention built an execution plan for every new sequence length | about a second on almost every served request | memory efficient kernel, with grouped heads expanded before it |
 | abstain combined groups by product | shrinks with group count, never fires at scale | weakest decline |
 | image source detected by string length | an 8x8 PNG encodes shorter than the threshold and was read as a path | check whether the file exists |
 | M-RoPE offset dropped on branch rows | Qwen3-VL raises rather than misplacing tokens | read `rope_deltas` after the prefix pass |
@@ -346,7 +374,9 @@ now saturate near 0 and 1, so the best threshold sits at 0.9999 rather than near
 **Noul regressed 8 points** moving to the vision model, and image tagging leans on noul.
 
 **Very long states fall off the prefill ceiling.** At 33,068 prefilled tokens the card runs
-at 7.1 TFLOP/s against 47.9 at 8,492. The prefix key value cache is about 4.9 GB at that
+at 1.9 TFLOP/s against 43.3 at 8,492. The memory efficient kernel made this worse, from
+52,813 ms on cuDNN to 155,903 ms. An image cannot reach this length, since the processor
+caps an image at 16,777,216 pixels, which is 16,384 image tokens. The prefix key value cache is about 4.9 GB at that
 length and every chunk copies it, which leaves a 24 GB card no room. Expanding the cache
 once and cropping between chunks was measured and is worse, at 12,732 ms against 1,710 ms
 and 23.66 GB against 15.12 GB, because a cropped cache is a non-contiguous view. Unsolved.

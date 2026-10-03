@@ -20,6 +20,8 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
+    AttentionInterface,
+    AttentionMaskInterface,
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -27,6 +29,8 @@ from transformers import (
     AutoTokenizer,
 )
 from transformers.cache_utils import DynamicCache
+from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
+from transformers.masking_utils import sdpa_mask
 
 from ..config import Config, canonical_model_id
 from ._torch_window import _determinism
@@ -44,8 +48,10 @@ CHUNK_TOKEN_CEILING = 2048
 
 # torch 2.11 ships no FlashAttention kernel on Windows. Left to choose for itself the
 # dispatcher then reaches the math backend, which builds the full attention matrix. On an
-# 8k prefill that measured 147 seconds and 27.6 GB against 1.3 seconds and 9.2 GB here.
-PREFERRED_ATTENTION = (SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION)
+# 8k prefill that measured 147 seconds and 27.6 GB against 1.3 seconds and 9.2 GB pinned.
+# cuDNN is left out because it builds an execution plan for every new sequence length,
+# which cost about a second on each request of unseen length. ab_attention_kernel.py.
+PREFERRED_ATTENTION = (SDPBackend.EFFICIENT_ATTENTION,)
 
 # When no preferred backend probes clean, the host's own enable flags would otherwise
 # decide which kernel runs, so two hosts could answer one request differently. Pinning
@@ -56,6 +62,35 @@ FALLBACK_ATTENTION = (
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
 )
+
+ATTENTION_IMPLEMENTATION = "logit_classifier_sdpa"
+
+
+def _expanded_sdpa_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Run transformers' sdpa attention with grouped key and value heads always expanded.
+
+    Without a mask transformers passes the grouped heads, which the memory efficient kernel
+    rejects. With a mask it expands them itself, so expanding here too would double them.
+    """
+    groups = getattr(module, "num_key_value_groups", 1)
+
+    if attention_mask is None and groups > 1:
+        key = repeat_kv(key, groups)
+        value = repeat_kv(value, groups)
+    return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
+
+
+AttentionInterface.register(ATTENTION_IMPLEMENTATION, _expanded_sdpa_attention)
+# transformers builds no mask for an attention name it does not know, which would let a
+# left padded branch row attend to its own padding.
+AttentionMaskInterface.register(ATTENTION_IMPLEMENTATION, sdpa_mask)
 
 
 def _usable_attention_backends(device: torch.device, dtype: torch.dtype) -> tuple[SDPBackend, ...]:
@@ -72,16 +107,16 @@ def _usable_attention_backends(device: torch.device, dtype: torch.dtype) -> tupl
     # shift the host's global RNG stream.
     generator = torch.Generator(device=device)
     query = torch.randn(1, 4, 64, 64, device=device, dtype=dtype, generator=generator)
-    key = torch.randn(1, 2, 64, 64, device=device, dtype=dtype, generator=generator)
     mask = torch.zeros(1, 1, 64, 64, device=device, dtype=dtype)
     attention = torch.nn.functional.scaled_dot_product_attention
     for backend in PREFERRED_ATTENTION:
         try:
             # A rejected backend warns on the way out, which is the answer we came for.
+            # These are the two forms _expanded_sdpa_attention sends, heads already expanded.
             with warnings.catch_warnings(), sdpa_kernel(backend):
                 warnings.simplefilter("ignore", UserWarning)
-                attention(query, key, key, is_causal=True, enable_gqa=True)
-                attention(query, key, key, attn_mask=mask, enable_gqa=True)
+                attention(query, query, query, is_causal=True, enable_gqa=True)
+                attention(query, query, query, attn_mask=mask)
             usable.append(backend)
         except RuntimeError:
             continue
@@ -111,6 +146,7 @@ class HFBackend:
                 cache_dir=cache_dir,
                 dtype=getattr(torch, config.dtype),
                 device_map=config.device,
+                attn_implementation=ATTENTION_IMPLEMENTATION,
             ).eval()
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(config.model_id, cache_dir=cache_dir)
@@ -119,6 +155,7 @@ class HFBackend:
                 cache_dir=cache_dir,
                 dtype=getattr(torch, config.dtype),
                 device_map=config.device,
+                attn_implementation=ATTENTION_IMPLEMENTATION,
             ).eval()
 
         self.label_ids = verify_backend(self)

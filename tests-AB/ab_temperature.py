@@ -27,10 +27,15 @@ GRID = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0]
 
 
 def collect(model: str, per_label: int, seed: int) -> dict:
+    classifier = Classifier(Config(model_id=model, use_prior_debias=False, permutations=1))
+    return collect_with(classifier, per_label, seed)
+
+
+def collect_with(classifier: Classifier, per_label: int, seed: int) -> dict:
     """Raw label logits per row, plus the option layout needed to rebuild a distribution."""
     data = banking77()
     criteria = dict.fromkeys(data["names"])
-    classifier = Classifier(Config(model_id=model, use_prior_debias=False, permutations=1))
+    model = classifier.config.model_id
     picked = stratified(data["label"], per_label, seed)
     print(f"collecting {len(picked)} rows on {model}", flush=True)
 
