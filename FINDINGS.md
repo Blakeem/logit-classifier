@@ -322,6 +322,29 @@ The two kernels round differently in bfloat16. Logits moved by a median of 0.25 
 which is inside the noise of that sample, so the fitted temperature stands. The same request
 still returns bitwise equal logits on 924 of 924 rows. `ab_attention_kernel.py`.
 
+## One frozen prefix cache, not a copy per chunk
+
+Each chunk used to deep copy the prefix cache and broadcast it across its rows, which stored
+rows times the prefix in every layer for the whole forward. The prefix cache is now frozen
+after the prefix pass, and each layer joins the broadcast prefix to the chunk's own keys and
+values only for that layer's attention.
+
+Both arms ran on one idle GPU, the commit before the change against the commit after.
+
+| Request | peak before | peak after | logits |
+|---|---|---|---|
+| mixed, four choices plus nouls plus scores | 10.67 GB | 8.75 GB | bitwise identical |
+| skewed, one wide choice beside twenty nouls | 10.95 GB | 8.76 GB | bitwise identical |
+| uniform, 256 nouls at the Jev cap | 8.74 GB | 8.39 GB | bitwise identical |
+| split, one 77 option choice | 8.61 GB | 8.40 GB | bitwise identical |
+| tile fragments, 24 nouls | 8.63 GB | 8.36 GB | bitwise identical |
+| uniform, 30 three option choices | 8.99 GB | 8.47 GB | bitwise identical |
+| uniform, 12 twenty option choices | 9.24 GB | 8.60 GB | bitwise identical |
+| 8,192 token state and 8 questions | 15.76 GB | 10.24 GB | bitwise identical |
+| image state, top-L.png | 8.37 GB | 8.34 GB | bitwise identical |
+
+The peaks in the two sections above were measured with the copy. `ab_frozen_prefix_cache.py`.
+
 ## One presence wording, two threshold pairs
 
 Correct tags per tile at a pooled precision, over 905 judged tile candidates on 23 tiles,
@@ -376,8 +399,8 @@ now saturate near 0 and 1, so the best threshold sits at 0.9999 rather than near
 **Very long states fall off the prefill ceiling.** At 33,068 prefilled tokens the card runs
 at 1.9 TFLOP/s against 43.3 at 8,492. The memory efficient kernel made this worse, from
 52,813 ms on cuDNN to 155,903 ms. An image cannot reach this length, since the processor
-caps an image at 16,777,216 pixels, which is 16,384 image tokens. The prefix key value cache is about 4.9 GB at that
-length and every chunk copies it, which leaves a 24 GB card no room. Expanding the cache
+caps an image at 16,777,216 pixels, which is 16,384 image tokens. The prefix key value cache was about 4.9 GB at that
+length and every chunk copied it, which left a 24 GB card no room. Expanding the cache
 once and cropping between chunks was measured and is worse, at 12,732 ms against 1,710 ms
 and 23.66 GB against 15.12 GB, because a cropped cache is a non-contiguous view. Unsolved.
 `benchmark.py`.

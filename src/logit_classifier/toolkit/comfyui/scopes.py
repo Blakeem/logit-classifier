@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from ...backends._torch_window import _determinism
-from ...backends.comfy_clip import _clip_parts, _resident
+from ...backends.comfy_clip import _clip_parts, _patched, _resident
 
 
 @contextmanager
@@ -21,8 +21,6 @@ def shared_vision_encode(clip: Any) -> Iterator[None]:
 
     transformer = _clip_parts(clip)[1]
     original = getattr(transformer, "preprocess_embed", None)
-    shadowed = "preprocess_embed" in vars(transformer)
-    previous = vars(transformer).get("preprocess_embed")
     cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
 
     if not callable(original):
@@ -40,15 +38,11 @@ def shared_vision_encode(clip: Any) -> Iterator[None]:
                 cache[key] = (data, original(embed, device=device))
         return cache[key][1]
 
-    transformer.preprocess_embed = preprocess_embed
-    try:
-        yield
-    finally:
-        cache.clear()
-        if shadowed:
-            transformer.preprocess_embed = previous
-        else:
-            del transformer.preprocess_embed
+    with _patched(transformer, "preprocess_embed", preprocess_embed):
+        try:
+            yield
+        finally:
+            cache.clear()
 
 
 @contextmanager
@@ -60,18 +54,11 @@ def skip_resident_loads(clip: Any) -> Iterator[None]:
     memory_required reservation core makes in CLIP.load_model.
     """
     original = clip.load_model
-    shadowed = "load_model" in vars(clip)
 
     def load_model(*args: Any, **kwargs: Any) -> Any:
         if _resident(clip):
             return clip.patcher
         return original(*args, **kwargs)
 
-    clip.load_model = load_model
-    try:
+    with _patched(clip, "load_model", load_model):
         yield
-    finally:
-        if shadowed:
-            clip.load_model = original
-        else:
-            del clip.load_model

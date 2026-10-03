@@ -143,11 +143,15 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # transformers annotates from_pretrained and eval loosely, which strict mode reads
 # as untyped calls. torch resolves to Any where the hf extra is absent, which makes
-# @torch.inference_mode() an untyped decorator. Every other strict check still
-# applies to this module.
+# @torch.inference_mode() an untyped decorator. CI installs no hf extra, so DynamicCache
+# resolves to Any there, which makes the prefix cache a subclass of Any and its update
+# return Any. An inline ignore would go unused locally, where transformers is typed.
+# Every other strict check still applies to this module.
 module = ["logit_classifier.backends.hf"]
 disallow_untyped_calls = false
 disallow_untyped_decorators = false
+disallow_subclassing_any = false
+warn_return_any = false
 
 [[tool.mypy.overrides]]
 # torch leaves fp16_bf16_reduction_math_sdp_allowed unannotated, and a line ignore

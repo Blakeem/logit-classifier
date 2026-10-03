@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
 from ...backends.base import VisionUnsupportedError
-from ...backends.comfy_clip import _transformer
+from ...backends.comfy_clip import _patched, _transformer
 from ...prompt import inert
 from ..tags import complete_tags, drop_unfinished_tag
 
@@ -72,8 +72,6 @@ def stop_when(clip: Any, should_stop: Callable[[list[str]], bool]) -> Iterator[N
         return
     stop_id = stop_tokens[0]
     original = transformer.sample_token
-    shadowed = "sample_token" in vars(transformer)
-    previous = vars(transformer).get("sample_token")
 
     def watch(*args: Any, **kwargs: Any) -> Any:
         token = original(*args, **kwargs)
@@ -82,14 +80,8 @@ def stop_when(clip: Any, should_stop: Callable[[list[str]], bool]) -> Iterator[N
             return token.new_full(token.shape, stop_id)
         return token
 
-    transformer.sample_token = watch
-    try:
+    with _patched(transformer, "sample_token", watch):
         yield
-    finally:
-        if shadowed:
-            transformer.sample_token = previous
-        else:
-            del transformer.sample_token
 
 
 def generate_text(

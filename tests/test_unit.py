@@ -1767,7 +1767,11 @@ class TestScoreScatter:
             config = SimpleNamespace(batch_branches=True, max_batch_rows=32)
             model = Model()
 
+            def __init__(self):
+                self.seen = []
+
             def _score_chunk(self, prefix_ids, seed, suffix_ids, label_counts, rope_delta=None):
+                self.seen.append((seed, seed.frozen))
                 # Each row carries its own suffix length, so a misplaced row shows up.
                 return [BranchLogits(z=np.array([float(len(s))]), candidate_mass=1.0)
                         for s in suffix_ids]
@@ -1787,6 +1791,73 @@ class TestScoreScatter:
 
     def test_no_suffixes_returns_nothing(self):
         assert self._backend().score(list(range(90)), [], []) == []
+
+    def test_every_chunk_reads_the_one_frozen_prefix_cache(self):
+        backend = self._backend()
+        from logit_classifier.backends.hf import _PrefixCache
+
+        # The 782 token branch breaks the chunk token ceiling, so this packs two chunks.
+        suffix_ids = [list(range(n)) for n in (33, 782, 33)]
+        backend.score(list(range(90)), suffix_ids, [2, 2, 2])
+        seeds = [seed for seed, _ in backend.seen]
+
+        assert len(seeds) == 2
+        assert all(frozen for _, frozen in backend.seen)
+        assert isinstance(seeds[0], _PrefixCache)
+        assert seeds[0] is seeds[1]
+
+
+class TestPrefixCache:
+    """Every chunk reads the one prefix cache, so no chunk's forward may store into it."""
+
+    @pytest.fixture
+    def torch_and_hf(self):
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("transformers")
+        from logit_classifier.backends import hf
+
+        return torch, hf
+
+    @staticmethod
+    def _frozen_seed(torch, hf, batch):
+        generator = torch.Generator().manual_seed(0)
+        seed = hf._PrefixCache()
+        for layer_idx in range(2):
+            keys = torch.randn(batch, 2, 5, 4, generator=generator, dtype=torch.bfloat16)
+            values = torch.randn(batch, 2, 5, 4, generator=generator, dtype=torch.bfloat16)
+            seed.update(keys, values, layer_idx)
+        seed.frozen = True
+        return seed
+
+    def test_a_frozen_update_matches_a_stored_copy_and_stores_nothing(self, torch_and_hf):
+        torch, hf = torch_and_hf
+        seed = self._frozen_seed(torch, hf, 1)
+        stored = [(layer.keys.clone(), layer.values.clone()) for layer in seed.layers]
+        generator = torch.Generator().manual_seed(1)
+        new_keys = torch.randn(3, 2, 6, 4, generator=generator, dtype=torch.bfloat16)
+        new_values = torch.randn(3, 2, 6, 4, generator=generator, dtype=torch.bfloat16)
+
+        keys, values = seed.update(new_keys, new_values, 1)
+
+        # The join a stored repeat_interleave copy gives the attention, which the logits
+        # stay bit-identical to only while bytes, dtype and strides all match it.
+        for joined, prefix, new in ((keys, stored[1][0], new_keys), (values, stored[1][1], new_values)):
+            expected = torch.cat([prefix.repeat_interleave(3, dim=0), new], dim=-2)
+            assert torch.equal(joined, expected)
+            assert joined.dtype == expected.dtype
+            assert joined.stride() == expected.stride()
+        for layer, (prefix_keys, prefix_values) in zip(seed.layers, stored, strict=True):
+            assert torch.equal(layer.keys, prefix_keys)
+            assert torch.equal(layer.values, prefix_values)
+        assert seed.get_seq_length() == 5
+
+    def test_a_frozen_seed_with_more_than_one_row_is_rejected(self, torch_and_hf):
+        torch, hf = torch_and_hf
+        seed = self._frozen_seed(torch, hf, 2)
+        new = torch.zeros(2, 2, 6, 4, dtype=torch.bfloat16)
+
+        with pytest.raises(RuntimeError, match="only a single prefix row"):
+            seed.update(new, new, 0)
 
 
 # The Qwen chat tokens a ComfyUI Qwen tokenizer keeps whole, at their real ids.
@@ -2064,6 +2135,36 @@ def fake_comfy(monkeypatch):
     for name, module in (("comfy", comfy), ("comfy.model_management", management), ("comfy.ops", ops)):
         monkeypatch.setitem(sys.modules, name, module)
     return state
+
+
+class PatchOwner:
+    def method(self):
+        return "class"
+
+
+class TestPatched:
+    """The one save, set and restore-or-delete protocol every CLIP attribute swap runs through."""
+
+    @pytest.mark.parametrize("shadowed", [True, False], ids=["was-shadowed", "class-held"])
+    @pytest.mark.parametrize("raises", [False, True], ids=["normal-exit", "exception"])
+    def test_the_attribute_is_restored(self, shadowed, raises):
+        from logit_classifier.backends.comfy_clip import _patched
+
+        owner = PatchOwner()
+        instance_method = owner.method
+        replacement = object()
+        if shadowed:
+            owner.method = instance_method
+
+        with contextlib.suppress(RuntimeError), _patched(owner, "method", replacement):
+            assert vars(owner)["method"] is replacement
+            if raises:
+                raise RuntimeError("the body blew up")
+
+        if shadowed:
+            assert vars(owner)["method"] is instance_method
+        else:
+            assert "method" not in vars(owner)
 
 
 class TestComfyClipBackend:
@@ -2633,9 +2734,7 @@ class TestSharedVisionEncode:
 
         assert len(transformer.encodes) == 2
 
-    @pytest.mark.parametrize("shadowed", [True, False], ids=["was-shadowed", "not-shadowed"])
-    @pytest.mark.parametrize("raises", [False, True], ids=["normal-exit", "exception"])
-    def test_the_instance_is_restored_and_the_cache_dropped(self, fake_comfy, shadowed, raises):
+    def test_the_instance_is_restored_and_the_cache_dropped(self, fake_comfy):
         torch = pytest.importorskip("torch")
         import gc
         import weakref
@@ -2643,27 +2742,19 @@ class TestSharedVisionEncode:
         from logit_classifier.toolkit.comfyui.scopes import shared_vision_encode
 
         transformer = EmbedCountingTransformer()
-        instance_encode = transformer.preprocess_embed
-        if shadowed:
-            transformer.preprocess_embed = instance_encode
         data = torch.zeros(1, 4, 4, 3)
         released = weakref.ref(data)
 
         with contextlib.suppress(RuntimeError), shared_vision_encode(FakeClip(transformer=transformer)):
             # A caller may keep the wrapper past the block, so only clearing the cache frees the tensor.
-            wrapper = transformer.preprocess_embed
+            wrapper = vars(transformer)["preprocess_embed"]
             wrapper({"type": "image", "data": data}, device="cpu")
-            if raises:
-                raise RuntimeError("the body blew up")
+            raise RuntimeError("the body blew up")
         del data
         gc.collect()
 
         assert released() is None
-        assert wrapper is not instance_encode
-        if shadowed:
-            assert vars(transformer)["preprocess_embed"] is instance_encode
-        else:
-            assert "preprocess_embed" not in vars(transformer)
+        assert "preprocess_embed" not in vars(transformer)
 
     def test_a_transformer_without_preprocess_embed_passes_through(self, fake_comfy):
         pytest.importorskip("torch")

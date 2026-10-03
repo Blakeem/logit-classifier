@@ -9,6 +9,8 @@ already holds both.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 from ..config import canonical_model_id
@@ -60,6 +62,22 @@ def _transformer(clip: Any) -> Any:
     encoder = getattr(model, encoder_name, None) if isinstance(encoder_name, str) else None
 
     return getattr(encoder, "transformer", None)
+
+
+@contextmanager
+def _patched(owner: object, name: str, replacement: object) -> Iterator[None]:
+    """Delete a class-held name on exit, since setting it back would pin a bound method on a CLIP instance core caches session-wide."""
+    shadowed = name in vars(owner)
+    previous = vars(owner).get(name)
+
+    setattr(owner, name, replacement)
+    try:
+        yield
+    finally:
+        if shadowed:
+            setattr(owner, name, previous)
+        else:
+            delattr(owner, name)
 
 
 def _clip_parts(clip: Any) -> tuple[Any, Any, str, str]:
@@ -409,8 +427,6 @@ class ComfyClipBackend:
         """
         transformer = self._transformer
         original = transformer.sample_token
-        shadowed = "sample_token" in vars(transformer)
-        previous = vars(transformer).get("sample_token")
         captured: list[Any] = []
 
         def capture(logits: Any, *args: Any, **kwargs: Any) -> Any:
@@ -418,15 +434,8 @@ class ComfyClipBackend:
             return original(logits, *args, **kwargs)
 
         # Inside the window, whose lock keeps two threads from interleaving the swap.
-        with _determinism():
-            transformer.sample_token = capture
-            try:
-                self.clip.generate({self._tokens_key: [tokens]}, do_sample=False, max_length=1)
-            finally:
-                if shadowed:
-                    transformer.sample_token = previous
-                else:
-                    del transformer.sample_token
+        with _determinism(), _patched(transformer, "sample_token", capture):
+            self.clip.generate({self._tokens_key: [tokens]}, do_sample=False, max_length=1)
 
         if not captured:
             raise BackendContractError(

@@ -55,8 +55,8 @@ pip install "logit-classifier[hf,service]"
 | `hf` | torch, torchvision, transformers, accelerate, safetensors, huggingface-hub, pillow | loading the weights in this process |
 | `service` | fastapi, uvicorn, pillow | the HTTP endpoint and the browser page |
 
-The `hf` extra needs an NVIDIA GPU. A short request peaks at about 11 GB of VRAM, and a
-state near 8,000 tokens peaks at about 16 GB. The weights are about 8 GB per model and
+The `hf` extra needs an NVIDIA GPU. A short request peaks at about 9 GB of VRAM, and a
+state near 8,000 tokens peaks at about 10 GB. The weights are about 8 GB per model and
 download on first use.
 
 They go to the Hugging Face cache by default. Point `models_dir` at a folder to keep them

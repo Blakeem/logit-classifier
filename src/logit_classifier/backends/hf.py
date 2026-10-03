@@ -6,7 +6,6 @@ position, the position the answer prefill forces to be the answer.
 
 from __future__ import annotations
 
-import copy
 import os
 import warnings
 from collections.abc import Iterator
@@ -28,7 +27,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
 from transformers.masking_utils import sdpa_mask
 
@@ -36,14 +35,18 @@ from ..config import Config, canonical_model_id
 from ._torch_window import _determinism
 from .base import BranchLogits, VisionUnsupportedError, verify_backend
 
-# One chunk's expanded prefix KV cache may take this much in all. The cost per row
-# grows with the context, so the row count shrinks as the context grows.
+# Rows times the whole context's key value bytes over every layer may come to this much
+# in one chunk. The prefix is stored once, and each layer joins it to the chunk's own keys
+# and values only for that layer's attention, so this bounds the transient join and the
+# width every row's attention reads. The cost per row grows with the context, so the row
+# count shrinks as the context grows.
 KV_BUDGET_BYTES = 6 * 1024**3
 
 # A chunk's suffix tokens, rows times padded width, checked only when a branch widens
-# the chunk it joins. The KV budget bounds what the prefix cache costs, and this bounds
-# what a wide branch can charge the narrow ones beside it. Anything from 512 to 2048
-# measured the same, and 4096 upward is clearly worse. ab_branch_packing.py.
+# the chunk it joins. The KV budget bounds each chunk's transient join and attention
+# width, and this bounds what a wide branch can charge the narrow ones beside it.
+# Anything from 512 to 2048 measured the same, and 4096 upward is clearly worse.
+# ab_branch_packing.py.
 CHUNK_TOKEN_CEILING = 2048
 
 # torch 2.11 ships no FlashAttention kernel on Windows. Left to choose for itself the
@@ -121,6 +124,38 @@ def _usable_attention_backends(device: torch.device, dtype: torch.dtype) -> tupl
         except RuntimeError:
             continue
     return tuple(usable)
+
+
+class _PrefixCache(DynamicCache):
+    """The prefix's key value cache, which every chunk reads without storing a copy.
+
+    A stored copy holds rows times the prefix in every layer for the whole forward. Once
+    frozen, a layer's join of the broadcast prefix and the chunk's own keys and values
+    lives only for that layer's attention, and it holds the same bytes at the same dtype
+    and strides as a stored copy's join. The layers never grow, so the sequence length the
+    mask builder and Qwen3-VL's text forward read before layer 0 stays the prefix length.
+    """
+
+    frozen: bool = False
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, *args: Any, **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.frozen:
+            return super().update(key_states, value_states, layer_idx, *args, **kwargs)
+
+        layer = self.layers[layer_idx]
+        if not isinstance(layer, DynamicLayer) or layer.keys is None or layer.values is None:
+            raise RuntimeError(f"prefix cache layer {layer_idx} holds no keys and values to share")
+        if layer.keys.shape[0] != 1:
+            raise RuntimeError(
+                f"prefix cache layer {layer_idx} holds {layer.keys.shape[0]} rows, and only a single "
+                "prefix row can be broadcast across a chunk"
+            )
+        rows = key_states.shape[0]
+        keys = torch.cat([layer.keys.expand(rows, -1, -1, -1), key_states], dim=-2)
+        values = torch.cat([layer.values.expand(rows, -1, -1, -1), value_states], dim=-2)
+        return keys, values
 
 
 class HFBackend:
@@ -272,9 +307,11 @@ class HFBackend:
     ) -> list[BranchLogits]:
         """Score every branch against one shared prefix.
 
-        The prefix is encoded once. Each chunk then copies that cache, broadcasts
-        it across the chunk's rows, and reads the final position of every row in
-        a single forward pass.
+        The prefix is encoded once into a cache that is then frozen. Every chunk
+        passes that one cache, and each layer joins the broadcast prefix to the
+        chunk's keys and values only for its own attention, so the KV budget bounds
+        that transient join and the attention width. A single forward pass reads
+        the final position of every row.
         """
         device = self.model.device
         scored: dict[int, BranchLogits] = {}
@@ -284,7 +321,7 @@ class HFBackend:
             return []
 
         prefix_tensor = torch.tensor([prefix_ids], device=device)
-        seed = DynamicCache()
+        seed = _PrefixCache()
         with self._pinned_forward():
             self.model(
                 input_ids=prefix_tensor,
@@ -300,6 +337,7 @@ class HFBackend:
                 rope_delta = getattr(self.model.model, "rope_deltas", None)
                 if rope_delta is not None:
                     rope_delta = rope_delta.clone()
+        seed.frozen = True
 
         # The port promises one row per suffix in the order given, so the packed
         # chunks are scattered back rather than concatenated.
@@ -315,7 +353,7 @@ class HFBackend:
     def _score_chunk(
         self,
         prefix_ids: list[int],
-        seed: DynamicCache,
+        seed: _PrefixCache,
         suffix_ids: list[list[int]],
         label_counts: list[int],
         rope_delta: torch.Tensor | None = None,
@@ -342,14 +380,12 @@ class HFBackend:
         if rope_delta is not None:
             placed = (placed + rope_delta.to(device)).unsqueeze(0).expand(3, rows, width)
 
-        cache = copy.deepcopy(seed)
-        cache.batch_repeat_interleave(rows)
         with self._pinned_forward():
             output = self.model(
                 input_ids=input_ids.to(device),
                 attention_mask=attention.to(device),
                 position_ids=placed,
-                past_key_values=cache,
+                past_key_values=seed,
                 use_cache=True,
                 logits_to_keep=1,
             )
@@ -358,7 +394,7 @@ class HFBackend:
         # Index on device so only the handful of label logits crosses the bus.
         selected = final.index_select(1, self._label_id_tensor)
         full_norm = torch.logsumexp(final, dim=-1)
-        del cache, output, final
+        del output, final
 
         for row, count in enumerate(label_counts):
             z = selected[row, :count]

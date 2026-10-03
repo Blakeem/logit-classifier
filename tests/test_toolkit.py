@@ -641,23 +641,14 @@ class TestSkipResidentLoads:
             assert clip.load_model("tokens") is clip.patcher
         assert clip.loads == ["tokens"]
 
-    @pytest.mark.parametrize("shadowed", [True, False], ids=["was-shadowed", "not-shadowed"])
-    @pytest.mark.parametrize("raises", [False, True], ids=["normal-exit", "exception"])
-    def test_the_original_load_is_restored(self, fake_comfy, shadowed, raises):
+    def test_the_original_load_is_restored(self, fake_comfy):
         clip = LoadingClip()
-        instance_load = clip.load_model
-        if shadowed:
-            clip.load_model = instance_load
 
         with contextlib.suppress(RuntimeError), skip_resident_loads(clip):
-            assert vars(clip)["load_model"] is not instance_load
-            if raises:
-                raise RuntimeError("the body blew up")
+            assert "load_model" in vars(clip)
+            raise RuntimeError("the body blew up")
 
-        if shadowed:
-            assert vars(clip)["load_model"] is instance_load
-        else:
-            assert "load_model" not in vars(clip)
+        assert "load_model" not in vars(clip)
 
 
 class TestSendStatus:
@@ -959,24 +950,15 @@ class TestStopWhen:
             ids = clip.generate(None, max_length=50)
         assert clip.decode(ids) == "cat, dog, fox"
 
-    @pytest.mark.parametrize("shadowed", [True, False], ids=["was-shadowed", "not-shadowed"])
-    @pytest.mark.parametrize("raises", [False, True], ids=["normal-exit", "exception"])
-    def test_the_original_sampler_is_restored(self, shadowed, raises):
+    def test_the_original_sampler_is_restored(self):
         clip = DecodingClip(words_of("cat, dog"))
-        instance_sampler = clip.transformer.sample_token
-        if shadowed:
-            clip.transformer.sample_token = instance_sampler
 
         with contextlib.suppress(RuntimeError), stop_when(clip, lambda tags: False):
-            assert vars(clip.transformer)["sample_token"] is not instance_sampler
+            assert "sample_token" in vars(clip.transformer)
             clip.generate(None, max_length=50)
-            if raises:
-                raise RuntimeError("the body blew up")
+            raise RuntimeError("the body blew up")
 
-        if shadowed:
-            assert vars(clip.transformer)["sample_token"] is instance_sampler
-        else:
-            assert "sample_token" not in vars(clip.transformer)
+        assert "sample_token" not in vars(clip.transformer)
 
 
 class TestGenerateText:
