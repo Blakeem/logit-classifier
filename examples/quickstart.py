@@ -65,7 +65,7 @@ def report(answers: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ask one state a few questions.")
-    parser.add_argument("--text", default=SAMPLE_TEXT, help="the text to classify")
+    parser.add_argument("--text", default=None, help="the text to classify, or a caption beside --image")
     parser.add_argument("--image", default=None, help="a picture to classify instead of the text")
     parser.add_argument("--model", default=None, help="a model id, else the configured default")
     args = parser.parse_args()
@@ -73,7 +73,11 @@ def main() -> None:
     config = Config(models_dir=MODELS_DIR)
     backend = load_model(args.model, config)
     classifier = Classifier(config, backend=backend)
-    state = {"image": args.image, "caption": args.text} if args.image else args.text
+    state: object = args.text if args.text is not None else SAMPLE_TEXT
+    if args.image:
+        state = {"image": args.image}
+        if args.text is not None:
+            state = {"image": args.image, "caption": args.text}
     questions = IMAGE_QUESTIONS if args.image else QUESTIONS
 
     print(f"model {backend.model_id}, reads images: {backend.sees_images}\n")

@@ -19,7 +19,8 @@ A `choice` holds up to 255 options. A `score` holds 2 to 10 levels. One request 
 to 256 questions, and every question is answered against the same state in one pass.
 
 A branch is one prompt whose last token position carries a distribution. A question needs
-one branch, or several when it holds more than 52 options or scores each level alone.
+one branch, or several when it holds more than 51 options (52 with `abstain` off) or scores
+each level alone.
 
 `abstain` is how strongly the model wants none of your options. Every choice question is
 offered an extra label named `none of these`, and that label's mass comes back as
@@ -35,6 +36,15 @@ over its options, so one winner takes nearly all the mass.
 
 The package needs Python 3.12 or newer.
 
+The `hf` extra needs a CUDA build of torch. The torch wheels on PyPI for Windows have no CUDA,
+so on Windows install torch from the PyTorch index first.
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+Then install the package.
+
 ```
 pip install "logit-classifier[hf,service]"
 ```
@@ -45,8 +55,9 @@ pip install "logit-classifier[hf,service]"
 | `hf` | torch, torchvision, transformers, accelerate, safetensors, huggingface-hub, pillow | loading the weights in this process |
 | `service` | fastapi, uvicorn, pillow | the HTTP endpoint and the browser page |
 
-The `hf` extra needs an NVIDIA GPU with at least 10 GB of free VRAM. The weights are
-about 8 GB per model and download on first use.
+The `hf` extra needs an NVIDIA GPU. A short request peaks at about 11 GB of VRAM, and a
+state near 8,000 tokens peaks at about 16 GB. The weights are about 8 GB per model and
+download on first use.
 
 They go to the Hugging Face cache by default. Point `models_dir` at a folder to keep them
 beside your project instead, which is what the examples do.
@@ -221,7 +232,7 @@ reads none of them. `logit-classifier config` prints what they produce.
 | `LOGIT_SCORE_METHOD` | `joint` | set to `independent` to judge each level alone |
 | `LOGIT_PERMUTATIONS` | `1` | letterings averaged per question, each one adds branches |
 | `LOGIT_ABSTAIN` | `1` | set to `0` to drop the `none of these` label below 52 options |
-| `LOGIT_CALIBRATION_PATH` | `calibration.json` | where the service stores the running prior |
+| `LOGIT_CALIBRATION_PATH` | `calibration.json` | where `Config.from_env()` stores the running prior |
 
 ## Calibration
 
@@ -236,9 +247,9 @@ The temperature is fitted per model and divides the logits. Both shipped values 
 fitted on Banking77 rather than on your data, so refit yours when the absolute numbers
 matter.
 
-The library holds the prior in memory and writes no file. The service stores it in
-`calibration.json`. Pass `Config(calibration_path=...)` to keep it across runs from the
-library. A stored prior carries a fingerprint of the model and the prompt shape, and
+`Config()` holds the prior in memory and writes no file. `Config.from_env()` stores it at
+`LOGIT_CALIBRATION_PATH` after every request, so the service keeps it across restarts. Pass
+`Config(calibration_path=...)` to pick the file yourself. A stored prior carries a fingerprint of the model and the prompt shape, and
 changing either one starts the prior over.
 
 ## Determinism
@@ -259,14 +270,15 @@ own settings everywhere outside a pass.
 
 ## Options Above 52
 
-Options are labeled `A` to `Z` then `a` to `z`, which gives 52 single token labels. A
-question with more options is split into groups, and each group carries an escape label so
+Options are labeled `A` to `Z` then `a` to `z`, which gives 52 single token labels. While
+`abstain` is on, the `none of these` label takes one of them. A question with more options
+than the free labels is split into groups, and each group carries an escape label so
 the groups can be weighed against each other. Accuracy is lower on that path and `abstain`
 is much weaker, so keep a question under 52 options where you can.
 
 ## Speed
 
-On a warm RTX 3090 Ti a short record takes about 140 ms whatever it asks, up to about 8
+On a warm RTX 3090 Ti a short record takes about 150 ms whatever it asks, up to about 8
 questions, because two forward passes dominate. So send every question for a record in one
 request. Keep a record under about 8,000 tokens, since a longer state falls off the
 prefill ceiling.
