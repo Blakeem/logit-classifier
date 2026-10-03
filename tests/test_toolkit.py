@@ -361,6 +361,11 @@ class TestInPrompt:
         assert in_prompt("tree", prompt_word_forms("three trees on a hill"))
         assert in_prompt("berries", prompt_word_forms("a berry"))
 
+    def test_a_short_ies_word_cuts_to_its_singular(self):
+        assert in_prompt("sky", prompt_word_forms("skies"))
+        assert in_prompt("skies", prompt_word_forms("sky"))
+        assert "ty" not in prompt_word_forms("ties")
+
     def test_every_content_word_needs_a_prompt_word(self):
         forms = prompt_word_forms("a red car beside a tree")
 

@@ -14,7 +14,6 @@ from typing import Annotated, Any
 from fastapi import Body, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .backends.base import VisionUnsupportedError
@@ -169,6 +168,3 @@ def healthz() -> dict[str, Any]:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
-
-
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")

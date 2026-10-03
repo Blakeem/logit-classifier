@@ -1,7 +1,8 @@
 """The readout port, the one boundary between the arithmetic and a host's forward pass.
 
 Everything above this port is stdlib and numpy. Everything below it is one host's
-way of turning token ids into a logit row: transformers here, a ComfyUI CLIP next.
+way of turning token ids into a logit row: transformers in hf.py, a ComfyUI CLIP in
+comfy_clip.py.
 """
 
 from __future__ import annotations

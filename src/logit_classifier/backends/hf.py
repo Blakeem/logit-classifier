@@ -36,8 +36,8 @@ from ..config import Config, canonical_model_id
 from ._torch_window import _determinism
 from .base import BranchLogits, VisionUnsupportedError, verify_backend
 
-# Expanding the shared prefix across batch rows costs this much per row, so the
-# batch has to shrink as the context grows.
+# One chunk's expanded prefix KV cache may take this much in all. The cost per row
+# grows with the context, so the row count shrinks as the context grows.
 KV_BUDGET_BYTES = 6 * 1024**3
 
 # A chunk's suffix tokens, rows times padded width, checked only when a branch widens
@@ -190,8 +190,8 @@ class HFBackend:
     def render(self, system: str, user: str, prefill: str, *, open_ended: bool = False) -> str:
         """Apply the chat template, then append the answer prefill.
 
-        open_ended returns only the user-message body, before the template closes the
-        turn, which is exactly the span every branch shares.
+        open_ended returns the rendered template up to the end of the user body, before
+        the template closes the turn, which is exactly the span every branch shares.
         """
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         rendered: str = self.tokenizer.apply_chat_template(
@@ -253,7 +253,7 @@ class HFBackend:
             rows = len(current) + 1
             # The ceiling exists to stop one wide branch dragging narrow ones out to
             # its width. A candidate no wider than the chunk adds no padding, so only
-            # the row cap applies and a request of one shape chunks as it always did.
+            # the row cap applies.
             widens = bool(current) and width > len(suffix_ids[current[-1]])
             over_ceiling = widens and rows * width > CHUNK_TOKEN_CEILING
             if current and (rows > allowed or over_ceiling):

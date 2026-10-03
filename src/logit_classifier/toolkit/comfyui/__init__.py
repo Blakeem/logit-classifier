@@ -1,6 +1,6 @@
 """The tools for a ComfyUI node that holds a loaded CLIP.
 
-Every module here imports comfy, server, torch and comfy_execution inside the functions that need them, so importing
+Every module here imports comfy, server and torch inside the functions that need them, so importing
 this package in a plain Python process loads none of them.
 """
 

@@ -155,7 +155,6 @@ pre.out { font: 12px/1.5 var(--mono); background: var(--bg); border: 1px solid v
 const $ = (id) => document.getElementById(id);
 let questions = [];
 let seq = 0;
-let lastResponse = null;
 
 const EXAMPLE = {
   context: "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP.",
@@ -343,7 +342,6 @@ async function run() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.message ? `${data.error}: ${data.message}` + (data.field ? ` (${data.field})` : "") : JSON.stringify(data, null, 2));
-    lastResponse = data;
     renderAnswers(data);
     $("rawOut").textContent = JSON.stringify(data, null, 2);
   } catch (e) {

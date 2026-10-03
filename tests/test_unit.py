@@ -8,9 +8,11 @@ import contextlib
 import io
 import json
 import re
+import struct
 import subprocess
 import sys
 import warnings
+import zlib
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import ClassVar
@@ -111,9 +113,13 @@ class TestBranchPlan:
         plan = plan_branches(255)
         assert max(len(g) for g in plan.groups) <= MAX_LABELS_PER_BRANCH - 1
 
-    def test_rejects_what_two_levels_cannot_hold(self):
-        with pytest.raises(LabelBoundaryError):
-            plan_branches(MAX_LABELS_PER_BRANCH * MAX_LABELS_PER_BRANCH)
+    def test_any_option_count_splits_into_groups_that_fit_one_branch(self):
+        count = MAX_LABELS_PER_BRANCH * MAX_LABELS_PER_BRANCH
+        plan = plan_branches(count)
+        covered = [i for group in plan.groups for i in group]
+        assert plan.split is True
+        assert sorted(covered) == list(range(count))
+        assert max(len(g) for g in plan.groups) <= MAX_LABELS_PER_BRANCH - 1
 
 
 class TestLabelIds:
@@ -276,6 +282,34 @@ class TestVision:
         monkeypatch.setattr(Path, "is_file", forbidden)
         with pytest.raises(ImageError, match=r"state\.screenshot"):
             extract_image({"screenshot": r"\\host\share\x.png"}, allow_paths=False)
+
+    def test_a_broken_chunk_inside_the_pixels_is_an_image_error(self):
+        # Pillow raises SyntaxError for a bad chunk it meets while decoding pixels.
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 64), "red").save(buffer, format="PNG")
+        data = buffer.getvalue()
+        start = data.index(b"IDAT") - 4
+        length = struct.unpack(">I", data[start:start + 4])[0]
+        body = data[start + 8:start + 8 + length]
+        half = len(body) // 2
+
+        def chunk(kind, payload):
+            return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+
+        broken = (data[:start] + chunk(b"IDAT", body[:half]) + chunk(b"\x00\x01\x02\x03", body[half:])
+                  + data[start + 12 + length:])
+        encoded = base64.b64encode(broken).decode()
+        with pytest.raises(ImageError, match="not a readable image"):
+            extract_image({"image": encoded}, allow_paths=False)
+
+    def test_a_state_with_two_images_is_rejected(self):
+        png = self._png("red")
+        with pytest.raises(ImageError, match="two images"):
+            extract_image({"image": png, "screenshot": png}, allow_paths=False)
+
+    def test_a_bad_data_url_payload_names_the_form_it_tried(self):
+        with pytest.raises(ImageError, match=r"^state\.image is a data URL whose payload is not valid base64"):
+            extract_image({"image": "data:image/png;base64,!!"}, allow_paths=False)
 
     def test_a_data_url_still_works_when_paths_are_off(self):
         _, image = extract_image({"image": "data:image/png;base64," + self._png("red")},
@@ -581,6 +615,9 @@ class TestConfigEnv:
         {"score_method": "Joint"},
         {"permutations": 0},
         {"max_batch_rows": 0},
+        {"dtype": "bf16"},
+        {"permutations": 2.5},
+        {"max_batch_rows": True},
     ])
     def test_direct_construction_is_validated(self, fields):
         # A ComfyUI pack builds Config itself and never passes through from_env.
@@ -1360,6 +1397,88 @@ class TestServeDependencies:
         monkeypatch.setitem(sys.modules, "fastapi", None)
         with pytest.raises(MissingDependencyError, match=r"logit-classifier\[service\]"):
             cli.main(["serve"])
+
+
+class TestService:
+    """The HTTP contract of /v1/systemone, served over a stub backend so no weights load."""
+
+    def _client(self, monkeypatch, backend=None):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        import logit_classifier.service as service
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        classifier = Classifier(Config(), backend=backend or StubBackend())
+        monkeypatch.setattr(service, "_loaded",
+                            service.Loaded(config=Config(), classifier=classifier, load_seconds=0.0))
+        # Entering the client as a context manager runs the lifespan, which loads the real model.
+        return service, TestClient(service.app)
+
+    def _png(self):
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), "red").save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    def test_a_schema_violation_is_rejected_naming_the_field(self, monkeypatch):
+        service, client = self._client(monkeypatch)
+        body = json.loads(json.dumps(service.EXAMPLE_REQUEST))
+        body["questions"]["department"]["type"] = "ranking"
+        response = client.post("/v1/systemone", json=body)
+        assert response.status_code == 422
+        assert response.json()["error"] == "unprocessable_entity"
+        assert response.json()["field"] == "questions.department.type"
+
+    def test_a_body_that_is_not_an_object_comes_back_as_an_error_body(self, monkeypatch):
+        _, client = self._client(monkeypatch)
+        response = client.post("/v1/systemone", json=[])
+        assert response.status_code == 422
+        assert set(response.json()) == {"error", "message", "field"}
+        assert response.json()["error"] == "unprocessable_entity"
+
+    def test_an_unreadable_image_is_rejected_as_the_state(self, monkeypatch):
+        service, client = self._client(monkeypatch)
+        body = {**service.EXAMPLE_REQUEST, "state": {"image": "not base64!"}}
+        response = client.post("/v1/systemone", json=body)
+        assert response.status_code == 422
+        assert response.json()["field"] == "state"
+
+    def test_an_image_the_backend_cannot_read_is_rejected_as_the_state(self, monkeypatch):
+        from logit_classifier.backends.base import VisionUnsupportedError
+
+        class BlindBackend(StubBackend):
+            def encode_prefix(self, text, image=None):
+                if image is not None:
+                    raise VisionUnsupportedError("this backend reads no images")
+                return super().encode_prefix(text, image)
+
+        service, client = self._client(monkeypatch, BlindBackend())
+        body = {**service.EXAMPLE_REQUEST, "state": {"image": self._png()}}
+        response = client.post("/v1/systemone", json=body)
+        assert response.status_code == 422
+        assert response.json()["field"] == "state"
+
+    def test_a_library_failure_is_an_internal_error(self, monkeypatch):
+        from logit_classifier.backends.base import BackendContractError
+
+        class BrokenBackend(StubBackend):
+            def score(self, prefix_ids, suffix_ids, label_counts, vision=None):
+                raise BackendContractError("score returned the wrong row count")
+
+        service, client = self._client(monkeypatch, BrokenBackend())
+        response = client.post("/v1/systemone", json=service.EXAMPLE_REQUEST)
+        assert response.status_code == 500
+        assert response.json()["error"] == "internal_error"
+
+    def test_diagnostics_carry_every_key_the_endpoint_writes(self, monkeypatch):
+        service, client = self._client(monkeypatch)
+        response = client.post("/v1/systemone", params={"diagnostics": 1}, json=service.EXAMPLE_REQUEST)
+        assert response.status_code == 200
+        assert set(response.json()["diagnostics"]) == {
+            "candidate_mass", "prior_applied", "branch_counts", "latency_ms",
+            "temperature", "score_method", "prior_observations",
+        }
 
 
 class TestModelLoading:

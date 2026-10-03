@@ -40,7 +40,7 @@ _ORDERS = ("score", "candidate")
 
 @dataclass(frozen=True, kw_only=True)
 class TagSettings:
-    """Every wording, budget, cap and threshold of the tagging stages.
+    """Every wording, budget, cap and threshold of the tagging stages, beyond the parse limits in toolkit/tags.py.
 
     The defaults are the current recommended values, and a later measurement may change them. A caller that needs
     fixed output passes every value it relies on.

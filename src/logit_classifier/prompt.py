@@ -32,8 +32,8 @@ SYSTEM_PROMPT = (
 # nothing to write and expands to the right length on its own.
 IMAGE_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
 
-# A split group carries this extra label so it can decline, which is what lets
-# groups be weighed against each other without a separate group branch.
+# A split group, and the single branch when abstain is on, carry this label so the branch can decline.
+# The mass kept off it weighs the groups, and the declined mass is the abstain score.
 ESCAPE_LABEL = "none of these"
 ESCAPE_DESCRIPTION = "the answer is not in this list"
 

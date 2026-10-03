@@ -61,6 +61,9 @@ ABSTAIN = True
 # the independent path without a word.
 SCORE_METHODS = frozenset({"joint", "independent"})
 
+# HFBackend resolves these with getattr(torch, ...), and the core imports no torch, so they are strings.
+DTYPES = frozenset({"bfloat16", "float16", "float32"})
+
 # Below this many observations the running prior is noise, so it stays unused.
 PRIOR_MIN_OBSERVATIONS = 32
 
@@ -79,6 +82,13 @@ def _reject_score_method(where: str, value: str) -> None:
         )
 
 
+def _reject_dtype(where: str, value: str) -> None:
+    if value not in DTYPES:
+        raise ConfigError(
+            f"{where}={value!r} is not a dtype. Accepted values are {', '.join(sorted(DTYPES))}."
+        )
+
+
 def _reject_temperature(where: str, value: float | None) -> None:
     if value is not None and not (math.isfinite(value) and value > 0):
         raise ConfigError(
@@ -87,10 +97,10 @@ def _reject_temperature(where: str, value: float | None) -> None:
         )
 
 
-def _reject_below_one(where: str, value: int) -> None:
-    if value < 1:
+def _reject_below_one(where: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ConfigError(
-            f"{where}={value!r} is below 1. Accepted values are whole numbers of 1 or more."
+            f"{where}={value!r} is not a count. Accepted values are whole numbers of 1 or more."
         )
 
 
@@ -158,6 +168,7 @@ class Config:
     def __post_init__(self) -> None:
         # A ComfyUI pack builds Config directly, so from_env cannot be the only check.
         _reject_score_method("Config.score_method", self.score_method)
+        _reject_dtype("Config.dtype", self.dtype)
         _reject_temperature("Config.temperature", self.temperature)
         _reject_below_one("Config.permutations", self.permutations)
         _reject_below_one("Config.max_batch_rows", self.max_batch_rows)

@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
 from ...backends.base import VisionUnsupportedError
+from ...backends.comfy_clip import _transformer
 from ...prompt import inert
 from ..tags import complete_tags, drop_unfinished_tag
 
@@ -51,15 +52,6 @@ def _drop_decode_graphs() -> None:
     except ImportError:
         return
     cleanup_prefetch_queues()
-
-
-def _transformer(clip: Any) -> Any:
-    """Core's generating transformer, or None for a CLIP without one."""
-    model = getattr(clip, "cond_stage_model", None)
-    encoder_name = getattr(model, "clip", None)
-    encoder = getattr(model, encoder_name, None) if isinstance(encoder_name, str) else None
-
-    return getattr(encoder, "transformer", None)
 
 
 @contextmanager

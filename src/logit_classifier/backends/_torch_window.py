@@ -51,8 +51,8 @@ def _determinism() -> Iterator[None]:
         saved_matmul = None if has_slots else torch.get_float32_matmul_precision()
         saved_cuda = torch.backends.cuda.matmul.fp32_precision if has_slots else None
         saved_mkldnn = mkldnn.fp32_precision if has_slots else None
-        # ComfyUI turns this on at import, at comfy/model_management.py:569. It governs
-        # the math attention backend, which runs only when attention_backends is empty.
+        # ComfyUI turns this on at import, at comfy/model_management.py:569. It governs the math
+        # attention backend, last in HFBackend's FALLBACK_ATTENTION and in core's own SDPA priority.
         has_sdp = hasattr(torch.backends.cuda, "allow_fp16_bf16_reduction_math_sdp") and hasattr(
             torch.backends.cuda, "fp16_bf16_reduction_math_sdp_allowed"
         )

@@ -76,8 +76,8 @@ def combine_escape(group_probabilities: list[np.ndarray]) -> tuple[np.ndarray, f
     """Merge groups whose last label is "none of these" into one distribution.
 
     A group's weight is the mass it did not put on its escape label, so the
-    groups compete without ever being summarised for the model. That removes the
-    separate group branch, and with it the label bias that branch carried.
+    groups compete without ever being summarised for the model. No branch labels the
+    groups, so no letter bias enters the group weights.
 
     The second return is the abstain score, which is how hard the least declining
     group declined. Every group has to decline for the question to be unanswerable,

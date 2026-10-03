@@ -53,6 +53,15 @@ class _PackedPrefix(NamedTuple):
     info: Any
 
 
+def _transformer(clip: Any) -> Any:
+    """Core's generating transformer, or None for a CLIP without one."""
+    model = getattr(clip, "cond_stage_model", None)
+    encoder_name = getattr(model, "clip", None)
+    encoder = getattr(model, encoder_name, None) if isinstance(encoder_name, str) else None
+
+    return getattr(encoder, "transformer", None)
+
+
 def _clip_parts(clip: Any) -> tuple[Any, Any, str, str]:
     """Return the Hugging Face tokenizer, the transformer and the two encoder names.
 
@@ -62,12 +71,10 @@ def _clip_parts(clip: Any) -> tuple[Any, Any, str, str]:
     tokenizer_name = getattr(getattr(clip, "tokenizer", None), "clip", None)
     encoder_name = getattr(getattr(clip, "cond_stage_model", None), "clip", None)
     tokenizer: Any = None
-    transformer: Any = None
+    transformer: Any = _transformer(clip)
 
     if isinstance(tokenizer_name, str):
         tokenizer = getattr(getattr(clip.tokenizer, tokenizer_name, None), "tokenizer", None)
-    if isinstance(encoder_name, str):
-        transformer = getattr(getattr(clip.cond_stage_model, encoder_name, None), "transformer", None)
     family = isinstance(encoder_name, str) and encoder_name.startswith(_FAMILY_PREFIX)
     generates = callable(getattr(clip, "generate", None)) and callable(getattr(clip, "decode", None))
     samples = callable(getattr(transformer, "sample_token", None)) and callable(
@@ -287,7 +294,7 @@ class ComfyClipBackend:
     ) -> list[BranchLogits]:
         """Encode the prefix once, then run each pass of packed suffixes as one forward.
 
-        The call sequence is CLIP.generate's, at comfy/sd.py:475-484, minus the generate.
+        The call sequence is CLIP.generate's, at comfy/sd.py:476-485, minus the generate.
         """
         import comfy.model_management as model_management
         import comfy.ops
@@ -311,7 +318,7 @@ class ComfyClipBackend:
                 clip.load_model({self._tokens_key: [prefix_tokens]})
             device = clip.patcher.load_device
             encoder.set_clip_options({"layer": None, "execution_device": device})
-            # BaseGenerate.generate picks its execution dtype this way, at llama.py:1115-1120.
+            # BaseGenerate.generate picks its execution dtype this way, at llama.py:1146-1150.
             dtype = torch.bfloat16 if model_management.should_use_bf16(device) else torch.float32
             with model_management.cuda_device_context(device), comfy.ops.use_quantized_matmul(encoder, device):
                 prefix = self._encode_packed_prefix(text_model, prefix_tokens, device)
@@ -357,7 +364,7 @@ class ComfyClipBackend:
         if visual_mask is not None:
             suffix_mask = torch.zeros((1, len(flat_ids)), dtype=torch.bool, device=device)
             visual_mask = torch.cat([visual_mask, suffix_mask], dim=1)
-        # Core reshapes this to (B, 1, L, L) and adds its own causal mask, at llama.py:929-941.
+        # Core reshapes this to (B, 1, L, L) and adds its own causal mask, at llama.py:961-972.
         hidden = transformer.model.forward(
             None,
             embeds=embeds,
@@ -398,7 +405,7 @@ class ComfyClipBackend:
         """Capture the full vocabulary row sample_token receives on the prefill step.
 
         The wrapper still returns the sampled token, since core copies it into
-        decode_tokens right after the call, at comfy/text_encoders/llama.py:1170-1172.
+        decode_tokens right after the call, at comfy/text_encoders/llama.py:1201-1203.
         """
         transformer = self._transformer
         original = transformer.sample_token

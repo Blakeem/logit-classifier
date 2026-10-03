@@ -53,7 +53,7 @@ def render_content(value: JSONContent | None) -> str:
 
 @dataclass(frozen=True, kw_only=True)
 class NoulCriteria:
-    """Wording for the two sides of a noul. `true` and `false` are reserved words."""
+    """Wording for the two sides of a noul, read from the wire keys `true` and `false`."""
 
     true_: JSONContent | None = None
     false_: JSONContent | None = None

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -45,7 +46,8 @@ def _normalise(opened: Image) -> Image:
 
 def _open_rgb(source: io.BytesIO | Path, what: str) -> Image:
     pil_image = require("PIL.Image", "service")
-    unreadable = (OSError, ValueError, pil_image.DecompressionBombError)
+    # Pillow reports a broken chunk found during decode as SyntaxError.
+    unreadable = (OSError, ValueError, SyntaxError, struct.error, pil_image.DecompressionBombError)
     limit = pil_image.MAX_IMAGE_PIXELS
 
     try:
@@ -63,12 +65,12 @@ def _open_rgb(source: io.BytesIO | Path, what: str) -> Image:
         raise ImageError(f"{what} is not a readable image: {error}") from error
 
 
-def _from_base64(value: str) -> Image:
+def _from_base64(value: str, key: str, tried: str) -> Image:
     try:
         raw = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
-        raise ImageError(f"image is neither a readable path nor valid base64: {error}") from error
-    return _open_rgb(io.BytesIO(raw), "the decoded base64")
+        raise ImageError(f"state.{key} is {tried}: {error}") from error
+    return _open_rgb(io.BytesIO(raw), f"the base64 in state.{key}")
 
 
 def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
@@ -82,25 +84,21 @@ def _decode(value: str, key: str, *, allow_paths: bool) -> Image:
     if value.startswith("data:"):
         _, _, payload = value.partition(",")
         if not payload:
-            raise ImageError("data URL carried no payload")
-        return _from_base64(payload)
+            raise ImageError(f"state.{key} is a data URL with no payload")
+        return _from_base64(payload, key, "a data URL whose payload is not valid base64")
     # A path probe over HTTP would let a client read server files, and a UNC path would
     # send the service account's credentials to a host the client names.
     if not allow_paths:
-        try:
-            return _from_base64(value)
-        except ImageError as error:
-            raise ImageError(
-                f"state.{key} is not a data URL or base64 image. The HTTP service accepts "
-                f"only those two forms: {error}"
-            ) from error
+        return _from_base64(
+            value, key, "not a data URL or base64 image. The HTTP service accepts only those two forms"
+        )
     try:
         candidate = Path(value)
         path = candidate if candidate.is_file() else None
     except (OSError, ValueError):
         path = None  # too long or illegal as a path, so it is not one
     if path is None:
-        return _from_base64(value)
+        return _from_base64(value, key, "neither a readable path nor valid base64")
     # UnidentifiedImageError subclasses OSError, so reading the file stays outside
     # the probe above, which would report a real file as bad base64.
     return _open_rgb(path, str(path))
@@ -125,8 +123,15 @@ def extract_image(state: Any, *, allow_paths: bool = True) -> tuple[Any, Image |
     """Return the state with any image removed, and the image itself."""
     key = image_key(state)
     remainder: dict[str, Any] = {}
+    other: str | None = None
 
     if key is None:
         return state, None
     remainder = {k: v for k, v in state.items() if k != key}
+    other = image_key(remainder)
+    if other is not None:
+        raise ImageError(
+            f"state carries images under both {key!r} and {other!r}, "
+            f"so the request holds two images and one prefix reads one"
+        )
     return (remainder or IMAGE_ONLY_STATE), _decode(state[key], key, allow_paths=allow_paths)

@@ -80,11 +80,6 @@ def plan_branches(option_count: int, *, abstain: bool = False) -> BranchPlan:
         return BranchPlan(groups=(tuple(range(option_count)),), split=False)
 
     group_count = -(-option_count // capacity)
-    if group_count > capacity:
-        raise LabelBoundaryError(
-            f"{option_count} options needs {group_count} groups, over the "
-            f"{capacity} label limit"
-        )
     group_size = -(-option_count // group_count)
     for start in range(0, option_count, group_size):
         groups.append(tuple(range(start, min(start + group_size, option_count))))

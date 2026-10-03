@@ -40,8 +40,9 @@ __all__ = [
     "tag_stop",
 ]
 
-# Bounds the packed verify pass. In the Logit Tagger's tests-AB/ab_tagger.py a 42 candidate
-# image fit one pass beside a 1 MP image.
+# The verify bound for a caller that verifies parse_candidates' list directly. In the Logit Tagger's
+# tests-AB/ab_tagger.py a 42 candidate image fit one pass beside a 1 MP image. The toolkit's own verify
+# pass is bounded by TagSettings.merge_cap.
 MAX_CANDIDATES = 48
 
 # A tag longer than this is a sentence or a run-on, not a noun phrase.
@@ -251,7 +252,7 @@ def _word_forms(text: str) -> dict[str, frozenset[str]]:
     for word in _PROMPT_WORD.findall(text.lower()):
         cuts = {word}
         for suffix, ending in _PLURAL_CUTS:
-            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+            if word.endswith(suffix) and len(word) - len(suffix) + len(ending) >= 3:
                 cuts.add(word[:-len(suffix)] + ending)
         forms[word] = frozenset(cuts)
     return forms
@@ -305,7 +306,8 @@ def tag_stop(*, max_tags: int | None, ungrounded_streak: int, word_forms: frozen
 class MergedCandidates(NamedTuple):
     """The merged candidates, each one's origin, and each left-out name with its reason.
 
-    An origin is "model", "prompt" or "both". A reason is "category noun", "repeat" or "over the cap".
+    An origin is "model", "prompt" or "both". merge_candidates writes the reasons "category noun", "repeat"
+    and "over the cap", and tag_image's thing check adds "not a thing".
     """
 
     candidates: tuple[str, ...]

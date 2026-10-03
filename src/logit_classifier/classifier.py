@@ -13,7 +13,7 @@ import numpy as np
 from .backends.base import Backend, BackendContractError, BranchLogits
 from .calibrate import PriorStore
 from .config import ANSWER_PREFILL, JEV_MAX_QUESTIONS, Config, fitted_temperature
-from .deps import MissingDependencyError
+from .deps import MissingDependencyError, install_line
 from .prompt import (
     PROMPT_VERSION,
     SYSTEM_PROMPT,
@@ -85,8 +85,7 @@ def load_model(model_id: str | None = None, config: Config | None = None) -> Bac
         from .backends.hf import HFBackend
     except ImportError as error:
         raise MissingDependencyError(
-            "no backend was passed and the local transformers backend is not installed. "
-            'Install it with: pip install "logit-classifier[hf]"'
+            f"no backend was passed and the local transformers backend is not installed. {install_line('hf')}"
         ) from error
     return HFBackend(config)
 
@@ -121,7 +120,7 @@ class Classifier:
     A caller that already holds a loaded model, such as a ComfyUI node over a
     resident text encoder, passes its own backend and no weights are loaded here.
 
-    One instance belongs to one backend. The fitted temperature and the prior bucket
+    One instance belongs to one backend. The fitted temperature and the prior fingerprint
     are both derived from the backend's model at construction, so swapping the
     backend afterwards leaves both belonging to the previous model.
     """
