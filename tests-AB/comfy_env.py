@@ -118,7 +118,9 @@ def bootstrap(comfy_root: Path, base_directory: Path, extra_args: Sequence[str] 
         sys.argv = saved_argv
 
     # main.py imports it before torch loads. It picks the app's cudaMallocAsync allocator from the parsed flags.
-    import cuda_malloc  # noqa: F401
+    # Once a harness has imported torch, switching the allocator crashes the first CUDA memory query.
+    if "torch" not in sys.modules:
+        import cuda_malloc  # noqa: F401
 
     # A missing comfy_aimdo or a raising init leaves the legacy ModelPatcher, and the warning below says so.
     try:
