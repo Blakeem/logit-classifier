@@ -456,21 +456,21 @@ class TestPriorStore:
         from logit_classifier.calibrate import PriorStore
 
         path = tmp_path / "calibration.json"
-        original = PriorStore(path, fingerprint="shape-a", min_observations=1)
+        original = PriorStore(path, fingerprint="shape-a", kinds={"choice"}, min_observations=1)
         for _ in range(4):
             original.observe("choice", np.array([0.9, 0.1]))
         original.save()
 
-        same = PriorStore(path, fingerprint="shape-a", min_observations=1)
+        same = PriorStore(path, fingerprint="shape-a", kinds={"choice"}, min_observations=1)
         assert same.stats() == {"choice:2": 4}
 
-        changed = PriorStore(path, fingerprint="shape-b", min_observations=1)
+        changed = PriorStore(path, fingerprint="shape-b", kinds={"choice"}, min_observations=1)
         assert changed.stats() == {}
 
     def test_prior_stays_unused_until_enough_observations(self, tmp_path):
         from logit_classifier.calibrate import PriorStore
 
-        store = PriorStore(tmp_path / "c.json", fingerprint="f", min_observations=3)
+        store = PriorStore(tmp_path / "c.json", fingerprint="f", kinds={"choice"}, min_observations=3)
         store.observe("choice", np.array([0.9, 0.1]))
         assert store.log_prior("choice", 2) is None
         store.observe("choice", np.array([0.9, 0.1]))
@@ -480,7 +480,7 @@ class TestPriorStore:
     def test_running_mean_tracks_the_observed_distribution(self, tmp_path):
         from logit_classifier.calibrate import PriorStore
 
-        store = PriorStore(tmp_path / "c.json", fingerprint="f", min_observations=1)
+        store = PriorStore(tmp_path / "c.json", fingerprint="f", kinds={"choice"}, min_observations=1)
         store.observe("choice", np.array([1.0, 0.0]))
         store.observe("choice", np.array([0.0, 1.0]))
         prior = store.log_prior("choice", 2)
@@ -490,7 +490,7 @@ class TestPriorStore:
     def test_a_store_with_no_path_learns_in_memory_and_writes_nothing(self, tmp_path):
         from logit_classifier.calibrate import PriorStore
 
-        store = PriorStore(None, fingerprint="f", min_observations=1)
+        store = PriorStore(None, fingerprint="f", kinds={"choice"}, min_observations=1)
         store.observe("choice", np.array([0.9, 0.1]))
         store.save()
         assert store.stats() == {"choice:2": 1}
@@ -506,14 +506,14 @@ class TestPriorStore:
                 {
                     "fingerprint": "f",
                     "means": {"choice:2": [0.4, 0.3, 0.3], "choice:3": None, "choice:4": "x",
-                              "binary:2": [0.6, 0.4]},
-                    "counts": {"choice:2": 9, "choice:3": 9, "choice:4": 9, "binary:2": 9},
+                              "choice:5": [0.2] * 5},
+                    "counts": {"choice:2": 9, "choice:3": 9, "choice:4": 9, "choice:5": 9},
                 }
             ),
             encoding="utf-8",
         )
-        store = PriorStore(path, fingerprint="f", min_observations=1)
-        assert store.stats() == {"binary:2": 9}
+        store = PriorStore(path, fingerprint="f", kinds={"choice"}, min_observations=1)
+        assert store.stats() == {"choice:5": 9}
         store.observe("choice", np.array([0.5, 0.5]))
         assert store.stats()["choice:2"] == 1
 
@@ -531,12 +531,12 @@ class TestPriorStore:
             ),
             encoding="utf-8",
         )
-        assert PriorStore(path, fingerprint="f", min_observations=1).stats() == {}
+        assert PriorStore(path, fingerprint="f", kinds={"choice"}, min_observations=1).stats() == {}
 
     def test_a_path_with_no_final_component_saves_nothing(self, tmp_path):
         from logit_classifier.calibrate import PriorStore
 
-        store = PriorStore(Path(tmp_path.anchor), fingerprint="f", min_observations=1)
+        store = PriorStore(Path(tmp_path.anchor), fingerprint="f", kinds={"choice"}, min_observations=1)
         store.observe("choice", np.array([0.9, 0.1]))
         store.save()
         assert store.stats() == {"choice:2": 1}
@@ -546,11 +546,19 @@ class TestPriorStore:
 
         path = tmp_path / "priors"
         path.mkdir()
-        store = PriorStore(path, fingerprint="f", min_observations=1)
+        store = PriorStore(path, fingerprint="f", kinds={"choice"}, min_observations=1)
         store.observe("choice", np.array([0.9, 0.1]))
         for _ in range(3):
             store.save()
         assert list(tmp_path.iterdir()) == [path]
+
+    def test_a_kind_the_store_does_not_learn_is_rejected(self):
+        from logit_classifier.calibrate import PriorStore
+
+        store = PriorStore(None, fingerprint="f", kinds={"choice"})
+        with pytest.raises(ValueError, match="not 'binary'"):
+            store.observe("binary", np.array([0.5, 0.5]))
+        assert store.stats() == {}
 
 
 class TestConfigEnv:
@@ -1180,20 +1188,27 @@ class TestExpandedAttention:
 
         return torch, hf
 
-    # The prefix pass sends no mask and the branch pass sends one, and transformers
-    # expands grouped heads itself only in the second case.
+    # The prefix pass sends no mask and the branch pass sends one. transformers expands grouped
+    # heads itself under a mask, and without one past a head width of 256 (5.17) or on an NPU (4.57).
     @pytest.mark.parametrize("masked", [False, True])
-    def test_the_kernel_sees_equal_heads_and_the_same_result(self, torch_and_hf, monkeypatch, masked):
+    @pytest.mark.parametrize("head_dim", [16, 288])
+    @pytest.mark.parametrize("key_heads", [2, 8], ids=["grouped", "expanded"])
+    def test_the_kernel_sees_equal_heads_and_the_same_result(
+        self, torch_and_hf, monkeypatch, masked, head_dim, key_heads,
+    ):
         torch, hf = torch_and_hf
-        from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
         generator = torch.Generator().manual_seed(0)
         module = SimpleNamespace(num_key_value_groups=4, is_causal=True)
-        query = torch.randn(1, 8, 6, 16, generator=generator)
-        key = torch.randn(1, 2, 6, 16, generator=generator)
-        value = torch.randn(1, 2, 6, 16, generator=generator)
+        query = torch.randn(1, 8, 6, head_dim, generator=generator)
+        key = torch.randn(1, key_heads, 6, head_dim, generator=generator)
+        value = torch.randn(1, key_heads, 6, head_dim, generator=generator)
         mask = torch.zeros(1, 1, 6, 6) if masked else None
-        expected, _ = sdpa_attention_forward(module, query, key, value, mask)
+        repeats = 8 // key_heads
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query, key.repeat_interleave(repeats, dim=1), value.repeat_interleave(repeats, dim=1),
+            attn_mask=mask, is_causal=not masked,
+        ).transpose(1, 2)
 
         heads = []
         original = torch.nn.functional.scaled_dot_product_attention
@@ -1207,6 +1222,15 @@ class TestExpandedAttention:
 
         assert heads == [(8, 8, 8)]
         torch.testing.assert_close(output, expected)
+
+    def test_query_heads_that_do_not_divide_by_the_key_heads_are_rejected(self, torch_and_hf):
+        torch, hf = torch_and_hf
+        module = SimpleNamespace(num_key_value_groups=2, is_causal=True)
+        query = torch.zeros(1, 8, 6, 16)
+        key = torch.zeros(1, 3, 6, 16)
+
+        with pytest.raises(ValueError, match="8 query heads against 3 key and value heads"):
+            hf._expanded_sdpa_attention(module, query, key, key, None)
 
     def test_the_attention_name_carries_a_mask_builder(self, torch_and_hf):
         # transformers builds no mask for a name it does not know, so a left padded
@@ -1270,6 +1294,28 @@ class TestPriorBuckets:
         assert classifier.priors.stats() == {"choice:4": 4}
         # A prior over the escape would pull this row's decline from 0.96 to 0.56.
         assert calibrated[-1] == pytest.approx(uncorrected[-1], abs=0.01)
+
+    def test_a_stored_noul_or_score_bucket_is_dropped_and_never_written_back(self, tmp_path):
+        # A calibration file from a release whose nouls and scores learned a prior holds
+        # binary and score buckets that nothing reads or updates any more.
+        from logit_classifier.classifier import Classifier
+        from logit_classifier.config import Config
+
+        path = tmp_path / "calibration.json"
+        config = Config(calibration_path=path)
+        fingerprint = Classifier(config, StubBackend())._fingerprint()
+        means = {"binary:2": [0.7, 0.3], "score:5": [0.2] * 5,
+                 "choice:2": [0.6, 0.4], "choice:4": [0.25] * 4}
+        path.write_text(json.dumps({"fingerprint": fingerprint, "means": means,
+                                    "counts": dict.fromkeys(means, 40)}), encoding="utf-8")
+
+        loaded = Classifier(config, StubBackend())
+        loaded.persist_prior()
+        written = json.loads(path.read_text(encoding="utf-8"))
+
+        assert loaded.priors.stats() == {"choice:2": 40, "choice:4": 40}
+        assert written["means"] == {"choice:2": [0.6, 0.4], "choice:4": [0.25] * 4}
+        assert written["counts"] == {"choice:2": 40, "choice:4": 40}
 
 
 class TestBackendIdentity:
@@ -1867,6 +1913,63 @@ class TestPrefixCache:
 
         with pytest.raises(RuntimeError, match="only a single prefix row"):
             seed.update(new, new, 0)
+
+    @staticmethod
+    def _tiny_qwen3(torch, implementation):
+        from transformers import AutoModelForCausalLM, Qwen3Config
+
+        # Grouped heads, so the prefix pass reaches the head expansion the kernel needs.
+        config = Qwen3Config(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                             num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+                             max_position_embeddings=512)
+        return AutoModelForCausalLM.from_config(
+            config, attn_implementation=implementation, dtype=torch.float32,
+        ).eval()
+
+    # A real transformers forward reads the cache's sequence length before layer 0, which
+    # update alone never exercises. Single row chunks are what LOGIT_BATCH_BRANCHES=0 sends.
+    @pytest.mark.parametrize("batch_branches", [True, False], ids=["batched", "one-row"])
+    def test_a_real_forward_scores_every_chunk_against_the_unchanged_prefix(self, torch_and_hf, batch_branches):
+        torch, hf = torch_and_hf
+        labels = [5, 6, 7, 8]
+        generator = torch.Generator().manual_seed(3)
+        prefix = torch.randint(1, 128, (37,), generator=generator).tolist()
+        # Two rows per chunk with these widths packs [1, 3], [5, 8] and [11], so two chunks
+        # left pad a row and the last holds a single row.
+        suffixes = [torch.randint(1, 128, (width,), generator=generator).tolist() for width in (5, 11, 3, 8, 1)]
+        # Initialising weights draws from the global RNG, which the tests after this one share.
+        # torch.manual_seed would also queue a CUDA reseed that fork_rng(devices=[]) never undoes.
+        with torch.random.fork_rng(devices=[]):
+            torch.default_generator.manual_seed(0)
+            model = self._tiny_qwen3(torch, hf.ATTENTION_IMPLEMENTATION)
+            eager = self._tiny_qwen3(torch, "eager")
+        eager.load_state_dict(model.state_dict())
+        backend = object.__new__(hf.HFBackend)
+        backend.model = model
+        backend.config = SimpleNamespace(batch_branches=batch_branches, max_batch_rows=2, dtype="float32")
+        backend._pad_id = 0
+        backend._label_id_tensor = torch.tensor(labels)
+        backend._kv_bytes_per_token = backend._measure_kv_bytes_per_token()
+        backend.attention_backends = ()
+        chunks = []
+        score_chunk = backend._score_chunk
+
+        def recording(prefix_ids, seed, suffix_ids, *rest):
+            rows = score_chunk(prefix_ids, seed, suffix_ids, *rest)
+            chunks.append((len(suffix_ids), seed.get_seq_length(), {layer.keys.shape[0] for layer in seed.layers}))
+            return rows
+
+        backend._score_chunk = recording
+        scored = backend.score(prefix, suffixes, [len(labels)] * len(suffixes))
+        with torch.inference_mode():
+            reference = [eager(input_ids=torch.tensor([prefix + suffix]), use_cache=False).logits[0, -1, labels]
+                         for suffix in suffixes]
+
+        assert [rows for rows, _, _ in chunks] == ([2, 2, 1] if batch_branches else [1] * 5)
+        assert all(length == len(prefix) for _, length, _ in chunks)
+        assert all(held == {1} for _, _, held in chunks)
+        for row, expected in zip(scored, reference, strict=True):
+            torch.testing.assert_close(torch.from_numpy(row.z), expected.double(), atol=1e-5, rtol=0)
 
 
 # The Qwen chat tokens a ComfyUI Qwen tokenizer keeps whole, at their real ids.

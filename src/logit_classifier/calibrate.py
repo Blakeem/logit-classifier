@@ -12,6 +12,7 @@ import contextlib
 import json
 import math
 import threading
+from collections.abc import Collection
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,10 +39,15 @@ def _stored_mean(key: str, vector: object) -> list[float] | None:
 
 class PriorStore:
     def __init__(
-        self, path: Path | None, fingerprint: str, min_observations: int = PRIOR_MIN_OBSERVATIONS
+        self,
+        path: Path | None,
+        fingerprint: str,
+        kinds: Collection[str],
+        min_observations: int = PRIOR_MIN_OBSERVATIONS,
     ) -> None:
         self.path = path
         self.fingerprint = fingerprint
+        self.kinds = frozenset(kinds)
         self.min_observations = min_observations
         self._lock = threading.Lock()
         self._means: dict[str, list[float]] = {}
@@ -81,6 +87,10 @@ class PriorStore:
             count = stored_counts.get(key)
             if mean is None or not isinstance(count, int) or isinstance(count, bool) or count < 0:
                 continue
+            # Nothing reads or updates a bucket of a kind the classifier does not learn, so
+            # keeping one would write it back on every save and report it forever.
+            if key.partition(":")[0] not in self.kinds:
+                continue
             means[key] = mean
             counts[key] = count
 
@@ -111,6 +121,8 @@ class PriorStore:
         """Fold one uncalibrated distribution into the running mean."""
         bucket = self._bucket(kind, len(probabilities))
 
+        if kind not in self.kinds:
+            raise ValueError(f"this prior store learns the kinds {sorted(self.kinds)}, not {kind!r}")
         with self._lock:
             count = self._counts.get(bucket, 0)
             mean = np.asarray(self._means.get(bucket, [0.0] * len(probabilities)), dtype=np.float64)

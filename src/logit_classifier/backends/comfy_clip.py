@@ -336,7 +336,7 @@ class ComfyClipBackend:
                 clip.load_model({self._tokens_key: [prefix_tokens]})
             device = clip.patcher.load_device
             encoder.set_clip_options({"layer": None, "execution_device": device})
-            # BaseGenerate.generate picks its execution dtype this way, at llama.py:1146-1150.
+            # BaseGenerate.generate picks its execution dtype this way, at llama.py:1149-1153.
             dtype = torch.bfloat16 if model_management.should_use_bf16(device) else torch.float32
             with model_management.cuda_device_context(device), comfy.ops.use_quantized_matmul(encoder, device):
                 prefix = self._encode_packed_prefix(text_model, prefix_tokens, device)
@@ -382,7 +382,7 @@ class ComfyClipBackend:
         if visual_mask is not None:
             suffix_mask = torch.zeros((1, len(flat_ids)), dtype=torch.bool, device=device)
             visual_mask = torch.cat([visual_mask, suffix_mask], dim=1)
-        # Core reshapes this to (B, 1, L, L) and adds its own causal mask, at llama.py:961-972.
+        # Core reshapes this to (B, 1, L, L) and adds its own causal mask, at llama.py:964-975.
         hidden = transformer.model.forward(
             None,
             embeds=embeds,
@@ -423,7 +423,7 @@ class ComfyClipBackend:
         """Capture the full vocabulary row sample_token receives on the prefill step.
 
         The wrapper still returns the sampled token, since core copies it into
-        decode_tokens right after the call, at comfy/text_encoders/llama.py:1201-1203.
+        decode_tokens right after the call, at comfy/text_encoders/llama.py:1208-1210.
         """
         transformer = self._transformer
         original = transformer.sample_token

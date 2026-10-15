@@ -55,9 +55,10 @@ pip install "logit-classifier[hf,service]"
 | `hf` | torch, torchvision, transformers, accelerate, safetensors, huggingface-hub, pillow | loading the weights in this process |
 | `service` | fastapi, uvicorn, pillow | the HTTP endpoint and the browser page |
 
-The `hf` extra needs an NVIDIA GPU. A short request peaks at about 9 GB of VRAM, and a
-state near 8,000 tokens peaks at about 10 GB. The weights are about 8 GB per model and
-download on first use.
+The `hf` extra needs an NVIDIA GPU. A short request peaks under 9 GiB of VRAM, and a state
+near 8,000 tokens peaks at about 10.2 GiB. Every VRAM figure in this README is an allocated
+peak, and the process needs more for the CUDA context and the allocator's cache. The weights
+take 8 to 9 GB of disk per model and download on first use.
 
 They go to the Hugging Face cache by default. Point `models_dir` at a folder to keep them
 beside your project instead, which is what the examples do.
@@ -156,7 +157,7 @@ the model.
 
 ```json
 {
-  "model": "logit-classifier-0.4.0",
+  "model": "logit-classifier-0.5.0",
   "answers": {
     "department": {
       "type": "choice",
@@ -279,10 +280,10 @@ is much weaker, so keep a question under 52 options where you can.
 
 ## Speed
 
-On a warm RTX 3090 Ti a short record takes about 150 ms whatever it asks, up to about 8
+On a warm RTX 3090 Ti a short record takes about 135 ms whatever it asks, up to about 8
 questions, because two forward passes dominate. So send every question for a record in one
-request. Keep a record under about 8,000 tokens, since a longer state falls off the
-prefill ceiling.
+request. A state near 8,000 tokens takes about 1.8 seconds. A state near 33,000 tokens takes
+about 11.5 seconds and peaks at about 15.2 GiB of VRAM.
 
 ## ComfyUI Node Packs
 

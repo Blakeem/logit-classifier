@@ -1,13 +1,17 @@
 """Does the running prior help or hurt a noul when the traffic is skewed?
 
-In the noul layout `A` is always yes and `B` is always no, so the binary prior bucket learns
-the yes rate of past requests rather than letter bias. This harness scores Banking77
+In the noul layout `A` is always yes and `B` is always no, so a prior over a noul's letters
+learns the yes rate of past requests rather than letter bias. This harness scores Banking77
 statements ("This message is about <intent>", true for the row's own intent and false for a
 random other one) as a stream of requests at several true rates. The prior-on arm runs each
 stream in order through one classifier, the way the service learns from its traffic. The
 prior-off arm scores every statement once, since its answers do not depend on order. Both
 arms read the same statements, and the first PRIOR_MIN_OBSERVATIONS requests of each stream
 are left out of the metrics, since the prior stays unused until then.
+
+From 3ac0294 on a noul learns no prior, so the prior-on arm would only repeat the prior-off
+arm, and the harness stops before scoring. The prior-on rows in FINDINGS.md reproduce only from
+a copy of this file run in a checkout of 00518c6, the parent of 3ac0294.
 
     uv run python tests-AB/ab_prior_traffic.py
 """
@@ -21,7 +25,7 @@ import time
 import numpy as np
 from ab_env import auc, banking77, stratified
 
-from logit_classifier.classifier import Classifier
+from logit_classifier.classifier import _PRIOR_KIND, Classifier
 from logit_classifier.config import PRIOR_MIN_OBSERVATIONS, Config
 from logit_classifier.schema import parse_request
 
@@ -87,6 +91,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    if "noul" not in _PRIOR_KIND:
+        raise SystemExit("a noul learns no prior on this commit, so both arms would score the same. "
+                         "Run a copy of this file in a checkout of 00518c6, the parent of 3ac0294.")
     data = banking77()
     picked = stratified(data["label"], args.per_label, args.seed)
     pool = statement_pool(data, picked)

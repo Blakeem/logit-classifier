@@ -85,7 +85,7 @@ def long_state(classifier: Classifier) -> None:
         first = timed_ms(classifier, request)
         warm = statistics.median(timed_ms(classifier, request) for _ in range(3))
         peak = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"  {arm:30}  first seen {first:7.0f} ms   warm {warm:7.0f} ms   peak {peak:5.2f} GB")
+        print(f"  {arm:30}  first seen {first:7.0f} ms   warm {warm:7.0f} ms   peak {peak:5.2f} GiB")
 
 
 def banking(classifier: Classifier) -> None:

@@ -90,10 +90,23 @@ A noul under the prior shows the same coupling. Banking77 statements ("This mess
 
 The AUC does not move, since the correction is one shift of the yes/no gap. The operating point
 moves with the traffic instead. A request took 126.6 ms with the prior off and 126.4 ms with it
-on, so the prior has no speed cost or gain. ContextAnchoredTileRefine's tags bench (45 judged
-tiles) kept 8.2 correct tags per tile with the prior off and 5.4 with it on. Its first tile
-matched, and the loss grew over the later tiles, which the earlier tiles' mostly true verify
-answers had trained. `ab_prior_traffic.py`.
+on, so the prior has no speed cost or gain. `ab_prior_traffic.py`.
+
+ContextAnchoredTileRefine's tags bench kept 8.2 correct tags per tile with the prior off and
+5.4 with it on, over 45 judged tiles on 15 pictures. The bench ran on 00518c6, before 3ac0294
+took the prior off nouls, so its prior also corrected the verify and locate nouls. The loss grew
+over the later tiles, which the earlier tiles' mostly true verify answers had trained.
+
+| Tile in run order | Correct tags, prior off | Correct tags, prior on |
+|---|---|---|
+| first | 114 | 111 |
+| second | 110 | 80 |
+| third | 146 | 52 |
+
+The first tile kept the same count on 13 of 15 pictures. It lost 2 tags on dragon4k and 1 on
+market4k, both under the long prompt. `ab_tags_bench.py` in
+ContextAnchoredTileRefine's `tests-AB/`, arms `prior-off` and `prior-on`, added in its commit
+bf6c7ba.
 
 ## Option order helps above 52 options and nowhere else
 
@@ -198,9 +211,10 @@ logits, and a run under a hostile host state matches a run under a pinned one, b
 gap of 0.0 on both models.
 
 `allow_fp16_bf16_reduction_math_sdp` is held for a different reason and the sweep above
-could not reach it. `sdpa_kernel` turns the math backend **off** while it holds the CUDA
-backends, so this setting is live only when `_usable_attention_backends` returns nothing and
-no `sdpa_kernel` block is entered. ComfyUI turns it **on** at import, at
+could not reach it. The math backend is **off** while `sdpa_kernel` holds the backends the
+probe found. When `_usable_attention_backends` returns nothing, the `FALLBACK_ATTENTION` block
+puts math last. So this setting is live only on a pass that flash, cuDNN and memory efficient
+attention all reject. ComfyUI turns it **on** at import, at
 `comfy/model_management.py:569`, so inside ComfyUI that path would run with reduced
 precision reductions.
 
@@ -237,7 +251,7 @@ Every row in a chunk is left-padded to that chunk's longest suffix, and each pad
 token costs a full forward plus attention over the whole prefix. Taking branches in the
 order the caller sent them drags short branches to the longest width.
 
-| Request shape | ms | peak GB | suffix tokens | chunks | |
+| Request shape | ms | peak GiB | suffix tokens | chunks | |
 |---|---|---|---|---|---|
 | mixed, four choices plus 12 nouls plus 4 scores | 2055.6 | 13.66 | 14600 | 1 | request order |
 | | **623.9** | **10.66** | **2614** | 3 | packed |
@@ -249,7 +263,7 @@ order the caller sent them drags short branches to the longest width.
 | 30 three option choices | 396 | 8.99 | 2160 | 1 | both, bitwise identical |
 | 12 twenty option choices | 586 | 9.24 | 3960 | 1 | both, bitwise identical |
 
-3.29x and 5.06x on the two shapes that mix widths, each giving back about 3 GB. Nothing
+3.29x and 5.06x on the two shapes that mix widths, each giving back about 3 GiB. Nothing
 at all on the five that do not, which is the point. The sort is stable, so equal lengths
 keep the caller's order and the grouping stays a pure function of the request.
 
@@ -264,12 +278,12 @@ width, which is every choice question, and moved its logits for no gain.
 
 | ceiling | mixed shape, 800 token prefix | mixed widths, long prefix |
 |---|---|---|
-| 512 | 610.9 ms, 9.91 GB, 5 chunks | 2015.7 ms, 5 chunks |
-| 1024 | 608.3 ms, 10.47 GB, 3 chunks | 2014.9 ms, 5 chunks |
-| **2048** | **626.0 ms, 10.66 GB, 3 chunks** | **2015.8 ms, 5 chunks** |
-| 4096 | 793.5 ms, 11.03 GB, 2 chunks | 2286.5 ms, 4 chunks |
-| 8192 | 1119.4 ms, 11.84 GB, 2 chunks | 2289.5 ms, 4 chunks |
-| none | 2062.2 ms, 13.66 GB, 1 chunk | 2299.1 ms, 4 chunks |
+| 512 | 610.9 ms, 9.91 GiB, 5 chunks | 2015.7 ms, 5 chunks |
+| 1024 | 608.3 ms, 10.47 GiB, 3 chunks | 2014.9 ms, 5 chunks |
+| **2048** | **626.0 ms, 10.66 GiB, 3 chunks** | **2015.8 ms, 5 chunks** |
+| 4096 | 793.5 ms, 11.03 GiB, 2 chunks | 2286.5 ms, 4 chunks |
+| 8192 | 1119.4 ms, 11.84 GiB, 2 chunks | 2289.5 ms, 4 chunks |
+| none | 2062.2 ms, 13.66 GiB, 1 chunk | 2299.1 ms, 4 chunks |
 
 Anything from 512 to 2048 measured the same on both, and 4096 upward is clearly worse.
 The value is not a knife edge. 2048 sits in the middle of the flat band and leaves the
@@ -285,43 +299,31 @@ two forward passes dominates a short record.
 
 | Questions per record | Total ms | ms per tag | Records per hour |
 |---|---|---|---|
-| 1 | 149 | 149 | 24,200 |
-| 4 | 148 | 37 | 24,300 |
-| 8 | 146 | 18.2 | 24,700 |
-| 32 | 280 | 8.8 | 12,800 |
+| 1 | 135 | 135 | 26,700 |
+| 4 | 132 | 33 | 27,300 |
+| 8 | 135 | 16.9 | 26,600 |
+| 32 | 295 | 9.2 | 12,200 |
 
 The state is prefilled once per record, so a longer record costs more.
 
-| State tokens | Total ms, 8 questions | ms per tag | Records per hour |
-|---|---|---|---|
-| 172 | 146 | 18.3 | 24,600 |
-| 556 | 184 | 23 | 19,600 |
-| 2,092 | 452 | 57 | 8,000 |
-| 8,236 | 1,742 | 218 | 2,100 |
-| 32,812 | 155,903 | 19,488 | 23 |
+| State tokens | Total ms, 8 questions | ms per tag | Records per hour | Peak GiB |
+|---|---|---|---|---|
+| 172 | 144 | 18.0 | 24,900 | 8.36 |
+| 556 | 199 | 24.9 | 18,100 | 8.48 |
+| 2,092 | 494 | 62 | 7,300 | 8.92 |
+| 8,236 | 1,805 | 226 | 2,000 | 10.23 |
+| 32,812 | 11,453 | 1,432 | 314 | 15.23 |
 
-Prefill runs at 43 to 46 TFLOP/s from about 2,000 tokens up, near this card's practical
-BF16 ceiling. Below that the time is almost all kernel launch rather than arithmetic, so a
-428 token request spends 0.14 ms on the math. The last row falls off the ceiling for the
-reason under Known weaknesses. `benchmark.py`.
-
-## The attention backend has to be pinned on Windows
-
-Torch 2.11 ships no FlashAttention kernel for Windows. Left to choose for itself the
-dispatcher reaches the math backend, which builds the full attention matrix. Measured on an
-8,192 token prefill.
-
-| Backend selection | Time | Peak memory |
-|---|---|---|
-| left to the dispatcher | 147,221 ms | 27.6 GB |
-| pinned to cudnn and efficient | 1,291 ms | 9.2 GB |
-
-`HFBackend` probes the backends at startup, at the model's own dtype, and pins the working
-ones. `benchmark.py`.
+The TFLOP/s count covers the weights' FLOPs only. Prefill runs at about 42 TFLOP/s from 2,348
+to 8,492 prefilled tokens. A 428 token prefill runs at 26.3 TFLOP/s and a 33,068 token prefill
+at 25.6. Attention work grows with the square of the state length, so the count leaves out the
+most work on the 33,068 token row. The peak is `torch.cuda.max_memory_allocated` in GiB, weights
+included. `benchmark.py`.
 
 ## The memory efficient kernel, not cuDNN
 
-cuDNN builds an execution plan the first time it sees a sequence length, and served requests
+Torch 2.11 ships no FlashAttention kernel for Windows, so `HFBackend` probes the backends at
+startup, at the model's own dtype, and pins one. cuDNN builds an execution plan the first time it sees a sequence length, and served requests
 rarely repeat a length. The memory efficient kernel has no such cost, but it rejects grouped
 key and value heads. transformers passes grouped heads whenever a pass has no mask, which is
 the prefix pass. So the model loads under its own attention name, which expands the heads
@@ -336,7 +338,7 @@ Both arms ran on one loaded model.
 | image request of unseen length, 132 image tokens | 2,257 ms | 214 ms |
 | 8,192 token state and 8 questions, unseen | 3,664 ms | 1,927 ms |
 | 8,192 token state and 8 questions, repeated | 1,672 ms | 1,742 ms |
-| peak memory at 8,192 tokens | 15.76 GB | 15.76 GB |
+| peak memory at 8,192 tokens | 15.76 GiB | 15.76 GiB |
 | Banking77, 462 held out rows, accuracy | 0.6255 | 0.6212 |
 | Banking77, 462 held out rows, ECE at T=1.25 | 0.0882 | 0.0834 |
 
@@ -356,17 +358,26 @@ Both arms ran on one idle GPU, the commit before the change against the commit a
 
 | Request | peak before | peak after | logits |
 |---|---|---|---|
-| mixed, four choices plus nouls plus scores | 10.67 GB | 8.75 GB | bitwise identical |
-| skewed, one wide choice beside twenty nouls | 10.95 GB | 8.76 GB | bitwise identical |
-| uniform, 256 nouls at the Jev cap | 8.74 GB | 8.39 GB | bitwise identical |
-| split, one 77 option choice | 8.61 GB | 8.40 GB | bitwise identical |
-| tile fragments, 24 nouls | 8.63 GB | 8.36 GB | bitwise identical |
-| uniform, 30 three option choices | 8.99 GB | 8.47 GB | bitwise identical |
-| uniform, 12 twenty option choices | 9.24 GB | 8.60 GB | bitwise identical |
-| 8,192 token state and 8 questions | 15.76 GB | 10.24 GB | bitwise identical |
-| image state, top-L.png | 8.37 GB | 8.34 GB | bitwise identical |
+| mixed, four choices plus nouls plus scores | 10.67 GiB | 8.75 GiB | bitwise identical |
+| skewed, one wide choice beside twenty nouls | 10.95 GiB | 8.76 GiB | bitwise identical |
+| uniform, 256 nouls at the Jev cap | 8.74 GiB | 8.39 GiB | bitwise identical |
+| split, one 77 option choice | 8.61 GiB | 8.40 GiB | bitwise identical |
+| tile fragments, 24 nouls | 8.63 GiB | 8.36 GiB | bitwise identical |
+| uniform, 30 three option choices | 8.99 GiB | 8.47 GiB | bitwise identical |
+| uniform, 12 twenty option choices | 9.24 GiB | 8.60 GiB | bitwise identical |
+| 8,192 token state and 8 questions | 15.76 GiB | 10.24 GiB | bitwise identical |
+| image state, top-L.png | 8.37 GiB | 8.34 GiB | bitwise identical |
 
-The peaks in the two sections above were measured with the copy. `ab_frozen_prefix_cache.py`.
+The peaks in the packing and kernel sections above were measured with the copy.
+`ab_frozen_prefix_cache.py`.
+
+A request of 33,068 prefilled tokens took 155,903 ms at 1.9 TFLOP/s on the memory efficient
+kernel and 52,813 ms on cuDNN while each chunk copied the prefix cache. The frozen cache brings
+it to 11,453 ms. `benchmark.py`.
+
+That request's prefix cache holds about 4.5 GiB. The figure is derived from the shipped config
+rather than measured, as 147,456 bytes per token (36 layers × 8 key value heads × 128 head_dim
+× 2 tensors × 2 bytes) times the 32,812 prefix tokens.
 
 ## One presence wording, two threshold pairs
 
@@ -419,15 +430,6 @@ chunk winners tournament and a second pass over each group's winner. Neither is 
 now saturate near 0 and 1, so the best threshold sits at 0.9999 rather than near 0.5.
 
 **Noul regressed 8 points** moving to the vision model, and image tagging leans on noul.
-
-**Very long states fall off the prefill ceiling.** At 33,068 prefilled tokens the card runs
-at 1.9 TFLOP/s against 43.3 at 8,492. The memory efficient kernel made this worse, from
-52,813 ms on cuDNN to 155,903 ms. An image cannot reach this length, since the processor
-caps an image at 16,777,216 pixels, which is 16,384 image tokens. The prefix key value cache was about 4.9 GB at that
-length and every chunk copied it, which left a 24 GB card no room. Expanding the cache
-once and cropping between chunks was measured and is worse, at 12,732 ms against 1,710 ms
-and 23.66 GB against 15.12 GB, because a cropped cache is a non-contiguous view. Unsolved.
-`benchmark.py`.
 
 ## Layout
 

@@ -1,4 +1,4 @@
-"""Warm-model latency and throughput, measured on the real backend.
+"""Warm-model latency, throughput and peak VRAM, measured on the real backend.
 
 Two shapes matter for bulk tagging. The state is encoded once per record, and every
 question against that record adds one branch. So the cost per tag falls as the number of
@@ -18,6 +18,8 @@ from logit_classifier.backends.hf import HFBackend
 from logit_classifier.config import ANSWER_PREFILL, Config
 from logit_classifier.prompt import SYSTEM_PROMPT, branch_content, build_branches, prefix_content
 from logit_classifier.schema import SystemOneRequest, parse_request
+
+GIB = 1024**3
 
 FILLER = (
     "The customer contacted support about a recurring billing problem on their account. "
@@ -78,6 +80,8 @@ def time_once(backend: HFBackend, request: SystemOneRequest) -> tuple[float, int
 
 def measure(backend: HFBackend, state: str, question_count: int, repeats: int) -> dict:
     request = make_request(state, question_count)
+
+    torch.cuda.reset_peak_memory_stats()
     time_once(backend, request)
     samples = [time_once(backend, request) for _ in range(repeats)]
     times = [s[0] for s in samples]
@@ -86,6 +90,7 @@ def measure(backend: HFBackend, state: str, question_count: int, repeats: int) -
         "min_ms": min(times),
         "prefix_tokens": samples[0][1],
         "suffix_tokens": samples[0][2],
+        "peak_gib": torch.cuda.max_memory_allocated() / GIB,
     }
 
 
@@ -112,7 +117,8 @@ def main() -> None:
               f"{count / (total / 1000):>8.1f} | {3600 / (total / 1000):>10,.0f}")
 
     print("\nB. State length, 8 questions per record")
-    header = f"{'state tok':>9} | {'total ms':>8} | {'ms/tag':>7} | {'tags/sec':>8} | {'records/hr':>10}"
+    header = (f"{'state tok':>9} | {'total ms':>8} | {'ms/tag':>7} | {'tags/sec':>8} | {'records/hr':>10} | "
+              f"{'peak GiB':>8}")
     print(header)
     print("-" * len(header))
     for tokens in [128, 512, 2048, 8192, 32768]:
@@ -122,7 +128,7 @@ def main() -> None:
         prefill = result["prefix_tokens"] + result["suffix_tokens"]
         flops = 2 * parameters * prefill
         print(f"{result['prefix_tokens']:>9} | {total:>8.1f} | {total / 8:>7.1f} | "
-              f"{8 / (total / 1000):>8.1f} | {3600 / (total / 1000):>10,.0f}"
+              f"{8 / (total / 1000):>8.1f} | {3600 / (total / 1000):>10,.0f} | {result['peak_gib']:>8.2f}"
               f"   [{prefill:>6} tok prefilled, {flops / (total / 1000) / 1e12:>5.1f} TFLOP/s]")
 
     print("\nC. Single question, single record, the worst case for amortising")

@@ -10,7 +10,7 @@ import os
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 # cuBLAS needs a fixed workspace before torch initialises CUDA to keep its
 # reductions reproducible.
@@ -49,9 +49,8 @@ KV_BUDGET_BYTES = 6 * 1024**3
 # ab_branch_packing.py.
 CHUNK_TOKEN_CEILING = 2048
 
-# torch 2.11 ships no FlashAttention kernel on Windows. Left to choose for itself the
-# dispatcher then reaches the math backend, which builds the full attention matrix. On an
-# 8k prefill that measured 147 seconds and 27.6 GB against 1.3 seconds and 9.2 GB pinned.
+# torch 2.11 ships no FlashAttention kernel on Windows, so a dispatcher left to choose for
+# itself can fall to the math backend, which builds the full attention matrix.
 # cuDNN is left out because it builds an execution plan for every new sequence length,
 # which cost about a second on each request of unseen length. ab_attention_kernel.py.
 PREFERRED_ATTENTION = (SDPBackend.EFFICIENT_ATTENTION,)
@@ -69,6 +68,18 @@ FALLBACK_ATTENTION = (
 ATTENTION_IMPLEMENTATION = "logit_classifier_sdpa"
 
 
+class _UngroupedModule:
+    """An attention module as transformers' sdpa reads it, with no key and value heads left to expand."""
+
+    num_key_value_groups = 1
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+
 def _expanded_sdpa_attention(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -77,17 +88,25 @@ def _expanded_sdpa_attention(
     attention_mask: torch.Tensor | None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Run transformers' sdpa attention with grouped key and value heads always expanded.
+    """Run transformers' sdpa attention with grouped key and value heads expanded exactly once.
 
-    Without a mask transformers passes the grouped heads, which the memory efficient kernel
-    rejects. With a mask it expands them itself, so expanding here too would double them.
+    The memory efficient kernel rejects grouped heads. Whether transformers expands them
+    itself turns on its version, the mask, the head width and the device, so the heads are
+    expanded here and transformers sees a module with nothing left to expand.
     """
-    groups = getattr(module, "num_key_value_groups", 1)
+    query_heads = query.shape[1]
+    key_heads = key.shape[1]
 
-    if attention_mask is None and groups > 1:
-        key = repeat_kv(key, groups)
-        value = repeat_kv(value, groups)
-    return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
+    if query_heads % key_heads:
+        raise ValueError(
+            f"attention got {query_heads} query heads against {key_heads} key and value heads, "
+            "and the query heads must be a whole multiple of them"
+        )
+    repeats = query_heads // key_heads
+    key = repeat_kv(key, repeats)
+    value = repeat_kv(value, repeats)
+    ungrouped = cast("torch.nn.Module", _UngroupedModule(module))
+    return sdpa_attention_forward(ungrouped, query, key, value, attention_mask, **kwargs)
 
 
 AttentionInterface.register(ATTENTION_IMPLEMENTATION, _expanded_sdpa_attention)
@@ -115,10 +134,12 @@ def _usable_attention_backends(device: torch.device, dtype: torch.dtype) -> tupl
     for backend in PREFERRED_ATTENTION:
         try:
             # A rejected backend warns on the way out, which is the answer we came for.
-            # These are the two forms _expanded_sdpa_attention sends, heads already expanded.
+            # These are the forms transformers sends once _expanded_sdpa_attention has
+            # expanded the heads. Its version decides whether an unmasked pass sets enable_gqa.
             with warnings.catch_warnings(), sdpa_kernel(backend):
                 warnings.simplefilter("ignore", UserWarning)
                 attention(query, query, query, is_causal=True, enable_gqa=True)
+                attention(query, query, query, is_causal=True)
                 attention(query, query, query, attn_mask=mask)
             usable.append(backend)
         except RuntimeError:

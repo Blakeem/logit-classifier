@@ -36,7 +36,7 @@ IMAGE = ab_env.INPUTS / "top-L.png"
 IMAGE_REQUEST = {"state": "", "questions": {"subject": {
     "type": "choice", "instructions": "What is the main subject of this image",
     "criteria": dict.fromkeys(["a person", "an animal", "a building", "a landscape", "an object"])}}}
-GB = 1024**3
+GIB = 1024**3
 
 
 def request_set(classifier: Classifier) -> dict[str, tuple[SystemOneRequest, Any]]:
@@ -67,7 +67,7 @@ def measure(out: Path) -> int:
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated()
         results[name] = {"peak_bytes": peak, "rows": [row.tolist() for row in captured]}
-        print(f"  {name[:52]:52}  {len(captured):4d} rows   peak {peak / GB:6.2f} GB")
+        print(f"  {name[:52]:52}  {len(captured):4d} rows   peak {peak / GIB:6.2f} GiB")
 
     # json writes a float64 as its shortest round trip repr, so the rows reload bit for bit.
     out.write_text(json.dumps({"model": classifier.config.model_id, "requests": results}),
@@ -95,14 +95,14 @@ def compare(before: Path, after: Path) -> int:
         print("the two files measured different request sets")
         return 1
 
-    header = f"{'request':52} {'before GB':>10} {'after GB':>9}  logits"
+    header = f"{'request':52} {'before GiB':>10} {'after GiB':>9}  logits"
     print(header)
     print("-" * len(header))
     for name, earlier in old["requests"].items():
         later = new["requests"][name]
         same = bitwise_equal(earlier["rows"], later["rows"])
         identical += same
-        print(f"{name[:52]:52} {earlier['peak_bytes'] / GB:10.2f} {later['peak_bytes'] / GB:9.2f}  "
+        print(f"{name[:52]:52} {earlier['peak_bytes'] / GIB:10.2f} {later['peak_bytes'] / GIB:9.2f}  "
               f"{'bitwise identical' if same else 'DIFFERENT'}")
     print(f"\n{identical} of {len(old['requests'])} requests came back bitwise identical")
     return 0 if identical == len(old["requests"]) else 1

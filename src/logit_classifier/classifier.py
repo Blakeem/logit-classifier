@@ -132,7 +132,7 @@ class Classifier:
             config.temperature if config.temperature is not None
             else fitted_temperature(_model_identity(self.backend))
         )
-        self.priors = PriorStore(config.calibration_path, self._fingerprint())
+        self.priors = PriorStore(config.calibration_path, self._fingerprint(), _PRIOR_KIND.values())
 
     def _fingerprint(self) -> str:
         """Identify the prompt shape a stored prior was measured under."""

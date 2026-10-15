@@ -113,7 +113,7 @@ class Run:
         finally:
             backend._score_chunk = original
         self.ms = (time.perf_counter() - started) * 1000
-        self.peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+        self.peak_gib = torch.cuda.max_memory_allocated() / 1024**3
         self.answers = response.to_dict()["answers"]
 
 
@@ -170,7 +170,7 @@ def main() -> int:
     packed_chunks = type(classifier.backend)._pack_chunks
 
     print()
-    header = f"{'shape':44} {'ms':>9} {'peak GB':>8} {'tokens':>8} {'chunks':>7}"
+    header = f"{'shape':44} {'ms':>9} {'peak GiB':>8} {'tokens':>8} {'chunks':>7}"
     print(header)
     print("-" * len(header))
 
@@ -186,11 +186,11 @@ def main() -> int:
         drift = 0.0 if same else float(np.max(np.abs(before_z - after_z)))
         speed = before.ms / after.ms if after.ms else 0.0
 
-        print(f"{name[:44]:44} {before.ms:9.1f} {before.peak_gb:8.2f} {before.tokens:8d} "
+        print(f"{name[:44]:44} {before.ms:9.1f} {before.peak_gib:8.2f} {before.tokens:8d} "
               f"{before.chunks:7d}  order")
-        print(f"{'':44} {after.ms:9.1f} {after.peak_gb:8.2f} {after.tokens:8d} "
+        print(f"{'':44} {after.ms:9.1f} {after.peak_gib:8.2f} {after.tokens:8d} "
               f"{after.chunks:7d}  packed")
-        print(f"{'':44} {speed:8.2f}x {before.peak_gb - after.peak_gb:7.2f} "
+        print(f"{'':44} {speed:8.2f}x {before.peak_gib - after.peak_gib:7.2f} "
               f"{before.tokens - after.tokens:8d}  saved, "
               f"{'bitwise identical' if same else f'max drift {drift:.4g}'}")
         print()
@@ -217,7 +217,7 @@ def main() -> int:
                 hf.CHUNK_TOKEN_CEILING = ceiling
                 run, _ = best_of(classifier, captured, request, packed_chunks)
                 label = "none" if ceiling > 1 << 20 else str(ceiling)
-                print(f"  ceiling {label:>6}  {run.ms:8.1f} ms  {run.peak_gb:5.2f} GB  "
+                print(f"  ceiling {label:>6}  {run.ms:8.1f} ms  {run.peak_gib:5.2f} GiB  "
                       f"{run.tokens:6d} tokens  {run.chunks:3d} chunks")
         hf.CHUNK_TOKEN_CEILING = shipped_ceiling
     return 0
