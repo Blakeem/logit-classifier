@@ -240,6 +240,53 @@ def fit_image(image: Any, max_pixels: int) -> Any:
     ).movedim(1, -1)
 
 
+def resample_image(image: Any, pixels: int) -> Any:
+    """Return the first three channels of a [B, H, W, C] image, area-resampled to about pixels total pixels.
+
+    Unlike fit_image it also enlarges, since ContextAnchoredTileRefine reads its style picture and its strips at a
+    fixed pixel count.
+    """
+    import comfy.utils
+
+    height, width = int(image.shape[1]), int(image.shape[2])
+    scale = 0.0
+    resampled: Any = None
+
+    if pixels < 1:
+        raise ValueError(f"resample_image got pixels={pixels!r}. Use 1 or more.")
+    scale = math.sqrt(pixels / (width * height))
+    resampled = comfy.utils.common_upscale(
+        image.movedim(-1, 1), round(width * scale), round(height * scale), "area", "disabled"
+    )
+    return resampled.movedim(1, -1)[..., :3]
+
+
+def _criterion_scores(
+    classifier: Classifier,
+    tags: Sequence[str],
+    *,
+    question: str,
+    criteria: tuple[tuple[str, str], ...],
+    criterion: str,
+    cache: dict[str, float],
+) -> tuple[float, ...]:
+    unknown = tuple(dict.fromkeys(tag for tag in tags if tag not in cache))
+    criteria_content: dict[str, JSONContent | None] = dict(criteria)
+    questions: dict[str, Question] = {}
+
+    if unknown:
+        # A literal replace, so braces in a tag are never read as format fields.
+        questions = {f"t{index}": ChoiceQuestion(instructions=question.replace(_TAG, tag), criteria=criteria_content)
+                     for index, tag in enumerate(unknown)}
+        response, _diagnostics = classifier.classify(SystemOneRequest(state="", questions=questions))
+        for tag, qid in zip(unknown, questions, strict=True):
+            answer = response.answers[qid]
+            if not isinstance(answer, ChoiceAnswer):
+                raise TypeError(f"{criterion} question {qid} got a {answer.type} answer, not a choice")
+            cache[tag] = answer.probabilities[criterion]
+    return tuple(cache[tag] for tag in tags)
+
+
 def thing_scores(
     classifier: Classifier, tags: Sequence[str], settings: TagSettings, thing_cache: dict[str, float]
 ) -> tuple[float, ...]:
@@ -247,22 +294,8 @@ def thing_scores(
 
     thing_cache carries the answers across a run, so each tag is asked once per cache.
     """
-    unknown = tuple(dict.fromkeys(tag for tag in tags if tag not in thing_cache))
-    criteria: dict[str, JSONContent | None] = dict(settings.thing_criteria)
-    questions: dict[str, Question] = {}
-
-    if unknown:
-        # A literal replace, so braces in a tag are never read as format fields.
-        questions = {f"t{index}": ChoiceQuestion(instructions=settings.thing_question.replace(_TAG, tag),
-                                                 criteria=criteria)
-                     for index, tag in enumerate(unknown)}
-        response, _diagnostics = classifier.classify(SystemOneRequest(state="", questions=questions))
-        for tag, qid in zip(unknown, questions, strict=True):
-            answer = response.answers[qid]
-            if not isinstance(answer, ChoiceAnswer):
-                raise TypeError(f"thing question {qid} got a {answer.type} answer, not a choice")
-            thing_cache[tag] = answer.probabilities["thing"]
-    return tuple(thing_cache[tag] for tag in tags)
+    return _criterion_scores(classifier, tags, question=settings.thing_question, criteria=settings.thing_criteria,
+                             criterion="thing", cache=thing_cache)
 
 
 def to_english(clip: Any, classifier: Classifier, prompt: str, settings: TagSettings) -> str:

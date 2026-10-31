@@ -157,7 +157,7 @@ the model.
 
 ```json
 {
-  "model": "logit-classifier-0.5.0",
+  "model": "logit-classifier-0.6.0",
   "answers": {
     "department": {
       "type": "choice",
@@ -341,6 +341,7 @@ and the classifier never imports the toolkit.
 | Package | Runs in | Holds |
 |---|---|---|
 | `logit_classifier.toolkit.tags` | any Python process | text tools for image tags and prompts |
+| `logit_classifier.toolkit.captions` | any Python process | `strip_thinking`, which removes a reasoning block, and `clean_caption`, which removes heading, meta and repeated lines from a caption |
 | `logit_classifier.toolkit.comfyui` | a ComfyUI node | a classifier over the workflow's CLIP, text generation, a progress display and an image tagger |
 
 ### Tag Text Tools
@@ -381,9 +382,14 @@ names the module of each tool it lists.
 | `scopes` | `skip_resident_loads` | skips core's model load while the CLIP is already on the GPU |
 | `progress` | `routed_progress_bars`, `send_status`, `run_outcome` | show one progress bar per run and a status line under the node |
 | `tagger` | `fit_image` | downscales an image to a pixel cap |
+| `tagger` | `resample_image` | resamples an image to a pixel count, up or down |
 | `tagger` | `tag_prompt` | lists the physical things a prompt names |
 | `tagger` | `tag_image` | tags an image, with a prompt's things added as candidates |
 | `tagger` | `TagSettings` | holds every wording, budget, cap and threshold of the tagger |
+| `describe` | `describe_image` | writes one greedy caption of an image, with a sampled and a one sentence fallback when the reply comes back empty |
+| `style` | `style_line`, `StyleSettings` | names the medium of an entire image and the style within that medium, in ContextAnchoredTileRefine's wording |
+| `style` | `prompt_style` | lists the medium and style words a prompt names, each one found in the prompt or in its English translation when the prompt is in another language |
+| `locate` | `locate_tags`, `render_placed` | scores each tag on six strips of an image and names its position, such as top-left |
 
 The tagger generates candidate tags over the CLIP and verifies each one with the classifier.
 
@@ -406,6 +412,20 @@ from logit_classifier.toolkit.tags import STRICT_THRESHOLDS
 
 settings = TagSettings(verify_thresholds=STRICT_THRESHOLDS)
 ```
+
+`locate_tags` drops a tag that no strip holds and places the rest.
+
+```python
+from logit_classifier.toolkit.comfyui import StyleSettings, locate_tags, render_placed, style_line
+
+style = style_line(clip, image, settings=StyleSettings(), node="My Tagger")
+places = locate_tags(classifier, image, tags)
+render_placed(places.placed)
+# 'red car bottom-left, cloud top'
+```
+
+The `prompt_style` defaults were picked on 152 image prompts that two blind judges graded, with
+ComfyUI-LogitTagger's `tests-AB/ab_style.py`.
 
 ## Differences From Jev
 

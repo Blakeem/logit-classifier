@@ -14,20 +14,35 @@ import pytest
 from logit_classifier import ChoiceAnswer, NoulAnswer, UnsupportedModelError, VisionUnsupportedError
 from logit_classifier.backends import comfy_clip
 from logit_classifier.toolkit import comfyui
+from logit_classifier.toolkit.captions import clean_caption, strip_thinking
 from logit_classifier.toolkit.comfyui import (
     IMAGE_SLOT,
+    POSITION_THRESHOLD,
+    STRIP_PIXELS,
+    PromptStyleTrace,
     PromptTagTrace,
+    StripBox,
+    StyleSettings,
+    TagPlaces,
     TagSettings,
     chat,
     clip_generate,
     comfy_classifier,
+    describe_image,
     fit_image,
     generate_text,
+    locate_tags,
+    prompt_style,
+    render_placed,
+    resample_image,
     routed_progress_bars,
     run_outcome,
     send_status,
     skip_resident_loads,
     stop_when,
+    strip_boxes,
+    style_line,
+    style_scores,
     tag_image,
     tag_prompt,
     thing_scores,
@@ -35,6 +50,8 @@ from logit_classifier.toolkit.comfyui import (
     token_fill,
 )
 from logit_classifier.toolkit.comfyui import classifier as comfyui_classifier
+from logit_classifier.toolkit.comfyui import locate as comfyui_locate
+from logit_classifier.toolkit.comfyui import style as comfyui_style
 from logit_classifier.toolkit.comfyui import tagger as comfyui_tagger
 from logit_classifier.toolkit.tags import (
     BROAD_THRESHOLDS,
@@ -490,6 +507,37 @@ class TestPresenceThresholds:
         assert isinstance(STRICT_THRESHOLDS, PresenceThresholds)
         for broad, strict in zip(BROAD_THRESHOLDS, STRICT_THRESHOLDS, strict=True):
             assert strict >= broad
+
+
+class TestStripThinking:
+    @pytest.mark.parametrize(("text", "answer"), [
+        ("<think>plan the answer</think>\nOil painting, loose brushwork.", "Oil painting, loose brushwork."),
+        ("<think>still reasoning when the budget ran out", ""),
+        ("<think>a</think> b </think> Watercolor.", "Watercolor."),
+        ("  Watercolor on paper.\n", "Watercolor on paper."),
+    ], ids=["closed", "unclosed", "stray-close-tag", "no-think-block"])
+    def test_keeps_only_the_answer(self, text, answer):
+        assert strip_thinking(text) == answer
+
+
+class TestCleanCaption:
+    @pytest.mark.parametrize(("text", "cleaned"), [
+        ("**Answer:**\nOil painting.", "Oil painting."),
+        ("Oil painting.\nWait, I need to rephrase to fit under 50 words.", "Oil painting."),
+        ("Oil painting.\n- Let me revise that.", "Oil painting."),
+        ("A fox in snow.\nA fox in snow.", "A fox in snow."),
+        ("A fox in snow.\n\na fox  in snow", "A fox in snow."),
+    ], ids=["heading", "meta-line", "bulleted-meta-line", "exact-repeat", "repeat-after-normalizing"])
+    def test_drops_an_artifact_line(self, text, cleaned):
+        assert clean_caption(text) == cleaned
+
+    def test_keeps_a_heading_after_content(self):
+        assert clean_caption("Oil painting.\n**Palette:**") == "Oil painting.\n**Palette:**"
+
+    @pytest.mark.parametrize("text", ["chicken, left\nchicken, right", "Oil painting,  \nsoft light.  "],
+                             ids=["near-repeat", "markdown-line-breaks"])
+    def test_a_text_with_nothing_to_remove_comes_back_as_the_same_string(self, text):
+        assert clean_caption(text) is text
 
 
 class InterruptProcessingException(BaseException):
@@ -1028,6 +1076,8 @@ class ReplyingClip(GeneratingClip):
 class TaggingClassifier:
     """Classifier, down to nouls and classify, with nouls scripted by statement and p("thing") by quoted tag."""
 
+    criterion: ClassVar[str] = "thing"
+
     def __init__(self, nouls=None, p_thing=None, events=None, answer=ChoiceAnswer):
         self.noul_of = nouls or {}
         self.p_thing = p_thing or {}
@@ -1049,8 +1099,18 @@ class TaggingClassifier:
         for qid, question in request.questions.items():
             p = self.p_thing.get(question.instructions.split('"')[1], 1.0)
             answers[qid] = (NoulAnswer(noul=p) if self.answer is NoulAnswer else
-                            ChoiceAnswer(choice="thing", confidence=p, probabilities={"thing": p, "other": 1.0 - p}))
+                            ChoiceAnswer(choice=self.criterion, confidence=p,
+                                         probabilities={self.criterion: p, "other": 1.0 - p}))
         return SimpleNamespace(answers=answers), None
+
+
+class StylingClassifier(TaggingClassifier):
+    """A TaggingClassifier whose choice answers carry p("style") and p("other"), with p("style") by quoted phrase."""
+
+    criterion: ClassVar[str] = "style"
+
+    def __init__(self, nouls=None, p_style=None, answer=ChoiceAnswer):
+        super().__init__(nouls=nouls, p_thing=p_style, answer=answer)
 
 
 # The fake verify scores sit below the broad proposed threshold, so a test that keeps model tags lowers it.
@@ -1447,3 +1507,441 @@ class TestFitImage:
     def test_rejects_a_cap_below_1(self, torch):
         with pytest.raises(ValueError, match=r"fit_image got max_pixels=0\. Use 1 or more"):
             fit_image(torch.rand(1, 2, 2, 3), 0)
+
+
+class TestResampleImage:
+    @pytest.fixture
+    def torch(self):
+        return pytest.importorskip("torch")
+
+    @pytest.fixture
+    def upscales(self, fake_comfy, monkeypatch, torch):
+        """comfy.utils.common_upscale, recording each call's input shape, size, mode and crop."""
+        calls = []
+
+        def common_upscale(samples, width, height, upscale_method, crop):
+            calls.append((tuple(samples.shape), width, height, upscale_method, crop))
+            return torch.zeros(samples.shape[0], samples.shape[1], height, width)
+
+        monkeypatch.setattr(sys.modules["comfy.utils"], "common_upscale", common_upscale, raising=False)
+        return calls
+
+    @pytest.mark.parametrize(("height", "width", "pixels", "size"), [
+        (50, 100, 20_000, (200, 100)),
+        (400, 400, 40_000, (200, 200)),
+    ], ids=["enlarges", "shrinks"])
+    def test_asks_core_for_an_area_resample_to_the_pixel_count(self, torch, upscales, height, width, pixels, size):
+        resampled = resample_image(torch.rand(1, height, width, 3), pixels)
+
+        assert upscales == [((1, 3, height, width), *size, "area", "disabled")]
+        assert tuple(resampled.shape) == (1, size[1], size[0], 3)
+
+    def test_keeps_the_first_three_channels(self, torch, upscales):
+        assert tuple(resample_image(torch.rand(1, 40, 40, 4), 6_400).shape) == (1, 80, 80, 3)
+        assert upscales[0][0] == (1, 4, 40, 40)
+
+    def test_rejects_a_pixel_count_below_1(self, torch, upscales):
+        with pytest.raises(ValueError, match=r"resample_image got pixels=0\. Use 1 or more"):
+            resample_image(torch.rand(1, 2, 2, 3), 0)
+        assert upscales == []
+
+
+class TestDescribeImage:
+    GREEDY: ClassVar[dict[str, object]] = {"do_sample": False, "max_length": 64, "repetition_penalty": 1.05}
+    SAMPLED: ClassVar[dict[str, object]] = {
+        "do_sample": True, "max_length": 64, "temperature": 0.7, "top_k": 64, "top_p": 0.95, "min_p": 0.05,
+        "repetition_penalty": 1.05, "seed": 42,
+    }
+
+    def test_returns_the_first_reply_uncleaned_after_one_greedy_generate(self):
+        clip = ReplyingClip("<think>look at the brushwork</think>Oil painting.\nOil painting.")
+        image = object()
+
+        text = describe_image(clip, image, "Name the medium.", max_tokens=64, node="Style Node")
+        assert text == "Oil painting.\nOil painting."
+        assert clip.tokenize_calls == [(chat("Name the medium.", image=True), {"images": [image]})]
+        assert [kwargs for _tokens, kwargs in clip.generate_calls] == [self.GREEDY]
+
+    def test_empty_replies_walk_to_the_sampled_and_then_the_one_sentence_request(self):
+        clip = ReplyingClip("**Answer:**", "<think>still reasoning", "A fox in snow.")
+        image = object()
+
+        text = describe_image(clip, image, "Name the medium.", max_tokens=64, node="Style Node")
+        assert text == "A fox in snow."
+        assert clip.tokenize_calls == [
+            (chat("Name the medium.", image=True), {"images": [image]}),
+            (chat("Write one short sentence describing this image.", image=True), {"images": [image]}),
+        ]
+        assert [kwargs for _tokens, kwargs in clip.generate_calls] == [self.GREEDY, self.SAMPLED, self.GREEDY]
+        assert clip.generate_calls[1][0] is clip.generate_calls[0][0]
+
+    def test_three_empty_replies_raise_with_the_node_name(self):
+        clip = ReplyingClip("", "<think>", "  ")
+
+        with pytest.raises(RuntimeError, match=r"^Style Node: the caption came back empty after every fallback"):
+            describe_image(clip, object(), "Name the medium.", max_tokens=64, node="Style Node")
+        assert len(clip.generate_calls) == 3
+
+    @pytest.mark.parametrize("missing", ["generate", "decode"])
+    def test_a_clip_that_cannot_generate_raises_with_the_node_name_before_any_tokenize(self, missing):
+        clip = GeneratingClip()
+        setattr(clip, missing, None)
+
+        with pytest.raises(RuntimeError, match=r"^Style Node: this CLIP cannot generate text\. .* such as krea2\.$"):
+            describe_image(clip, object(), "Name the medium.", max_tokens=64, node="Style Node")
+        assert clip.tokenize_calls == []
+
+    def test_a_tokenizer_without_images_raises_vision_unsupported(self):
+        clip = TextTokenizerClip()
+
+        with pytest.raises(VisionUnsupportedError, match=r"^this CLIP's tokenizer does not read images"):
+            describe_image(clip, object(), "Name the medium.", max_tokens=64, node="Style Node")
+        assert clip.generate_calls == []
+
+
+class TestStyleSettings:
+    def test_the_bounds_construct(self):
+        assert StyleSettings(image_max_tokens=1, image_pixels=1).image_max_tokens == 1
+        assert StyleSettings(image_max_tokens=4096).image_max_tokens == 4096
+        assert StyleSettings(prompt_max_tokens=1, ungrounded_streak=0, style_threshold=0.0).prompt_max_tokens == 1
+        assert StyleSettings(prompt_max_tokens=4096, style_threshold=1.0).style_threshold == 1.0
+
+    def test_the_defaults_hash(self):
+        assert hash(StyleSettings()) == hash(StyleSettings())
+
+    def test_the_style_criteria_may_hold_more_keys(self):
+        criteria = (*StyleSettings().style_criteria, ("unsure", "a word with no clear referent"))
+
+        assert StyleSettings(style_criteria=criteria).style_criteria == criteria
+
+    @pytest.mark.parametrize(("field", "value"), [
+        ("image_instruction", ""),
+        ("image_instruction", "  "),
+        ("image_max_tokens", 0),
+        ("image_max_tokens", 4097),
+        ("image_pixels", 0),
+        ("prompt_instruction", "List the style words."),
+        ("prompt_max_tokens", 0),
+        ("prompt_max_tokens", 4097),
+        ("ungrounded_streak", -1),
+        ("style_question", "What does the tag name"),
+        ("style_criteria", (("style", "a medium"),)),
+        ("style_criteria", (("other", "a thing"), ("style", "a medium"))),
+        ("style_threshold", -0.1),
+        ("style_threshold", 1.5),
+        ("style_threshold", float("nan")),
+    ], ids=["empty-instruction", "blank-instruction", "no-tokens", "too-many-tokens", "no-pixels",
+            "prompt-placeholder", "no-prompt-tokens", "too-many-prompt-tokens", "streak", "style-placeholder",
+            "one-criterion", "style-not-first", "threshold-negative", "threshold-high", "threshold-nan"])
+    def test_rejects_a_bad_value(self, field, value):
+        with pytest.raises(ValueError, match=r"^StyleSettings got ") as caught:
+            StyleSettings(**{field: value})
+        assert f"{field}={value!r}" in str(caught.value)
+
+
+class TestStyleLine:
+    @pytest.fixture
+    def resamples(self, monkeypatch):
+        """The style module's resample_image, recording each image and pixel count and returning one stand-in."""
+        record = SimpleNamespace(calls=[], picture=object())
+
+        def resample(image, pixels):
+            record.calls.append((image, pixels))
+            return record.picture
+
+        monkeypatch.setattr(comfyui_style, "resample_image", resample)
+        return record
+
+    def test_resamples_asks_the_instruction_and_cleans_the_reply(self, resamples):
+        clip = ReplyingClip("Oil painting, impressionist.\nOil painting, impressionist.")
+        image = SimpleNamespace(shape=(1, 512, 512, 3))
+        settings = StyleSettings()
+
+        line = style_line(clip, image, settings=settings, node="Style Node")
+        (_tokens, kwargs), = clip.generate_calls
+        assert line == "Oil painting, impressionist."
+        assert resamples.calls == [(image, 786_432)]
+        assert clip.tokenize_calls == [(chat(settings.image_instruction, image=True), {"images": [resamples.picture]})]
+        assert kwargs["max_length"] == 768
+
+    def test_reads_every_value_from_the_settings(self, resamples):
+        clip = ReplyingClip("Watercolor.")
+        image = SimpleNamespace(shape=(1, 64, 64, 3))
+        settings = StyleSettings(image_instruction="Name the medium.", image_max_tokens=32, image_pixels=4_096)
+
+        assert style_line(clip, image, settings=settings, node="Style Node") == "Watercolor."
+        assert resamples.calls == [(image, 4_096)]
+        assert clip.tokenize_calls[0][0] == chat("Name the medium.", image=True)
+        assert clip.generate_calls[0][1]["max_length"] == 32
+
+    def test_a_batch_of_two_raises(self, resamples):
+        clip = ReplyingClip("Oil painting.")
+
+        with pytest.raises(ValueError, match=r"^Style Node: style_line got a batch of 2 images"):
+            style_line(clip, SimpleNamespace(shape=(2, 64, 64, 3)), settings=StyleSettings(), node="Style Node")
+        assert resamples.calls == []
+        assert clip.generate_calls == []
+
+
+class TestStyleScores:
+    def test_asks_each_unknown_phrase_once_in_one_text_only_request(self):
+        classifier = StylingClassifier(p_style={"oil painting": 0.9, "red barn": 0.1})
+        settings = StyleSettings()
+        style_cache = {"watercolor": 0.8}
+
+        scores = style_scores(classifier, ["oil painting", "watercolor", "red barn", "oil painting"], settings,
+                              style_cache)
+        (request, image), = classifier.classify_calls
+        assert scores == (0.9, 0.8, 0.1, 0.9)
+        assert image is None
+        assert request.state == ""
+        assert [question.instructions for question in request.questions.values()] == [
+            settings.style_question.replace("{TAG}", "oil painting"), settings.style_question.replace("{TAG}", "red barn")]
+        assert all(question.criteria == dict(settings.style_criteria) for question in request.questions.values())
+        assert style_cache == {"watercolor": 0.8, "oil painting": 0.9, "red barn": 0.1}
+
+    def test_cached_phrases_make_no_request(self):
+        classifier = StylingClassifier()
+
+        assert style_scores(classifier, ["oil painting"], StyleSettings(), {"oil painting": 0.3}) == (0.3,)
+        assert classifier.classify_calls == []
+
+    def test_a_non_choice_answer_raises(self):
+        with pytest.raises(TypeError, match=r"^style question t0 got a noul answer, not a choice"):
+            style_scores(StylingClassifier(answer=NoulAnswer), ["oil painting"], StyleSettings(), {})
+
+
+class TestPromptStyle:
+    @pytest.mark.parametrize("prompt", ["", "   \n"], ids=["empty", "blank"])
+    def test_a_blank_prompt_makes_no_call(self, prompt):
+        clip = ReplyingClip()
+        classifier = StylingClassifier()
+
+        assert prompt_style(clip, classifier, prompt, settings=StyleSettings(), tag_settings=TagSettings(),
+                            style_cache={}) == PromptStyleTrace(text="", reply="", listed=(), p_style=(), style=())
+        assert clip.tokenize_calls == []
+        assert classifier.noul_calls == []
+        assert classifier.classify_calls == []
+
+    def test_lists_the_grounded_phrases_the_style_check_keeps(self):
+        clip = ReplyingClip("oil painting, red barn, impressionism")
+        classifier = StylingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_style={"oil painting": 0.9, "red barn": 0.1})
+        settings = StyleSettings()
+        style_cache = {}
+
+        result = prompt_style(clip, classifier, "an oil painting of a red barn", settings=settings,
+                              tag_settings=TagSettings(), style_cache=style_cache)
+        (text, _kwargs), = clip.tokenize_calls
+        (_tokens, generate_kwargs), = clip.generate_calls
+        assert result == PromptStyleTrace(text="an oil painting of a red barn",
+                                          reply="oil painting, red barn, impressionism",
+                                          listed=("oil painting", "red barn"), p_style=(0.9, 0.1),
+                                          style=("oil painting",))
+        assert text == chat(settings.prompt_instruction.replace("{PROMPT}", "an oil painting of a red barn"))
+        assert generate_kwargs == {"do_sample": False, "max_length": 128}
+        assert style_cache == {"oil painting": 0.9, "red barn": 0.1}
+
+    def test_lists_and_grounds_from_the_translation(self):
+        prompt = "una pintura al óleo de un granero rojo"
+        clip = ReplyingClip("an oil painting of a red barn", "oil painting, granero")
+        classifier = StylingClassifier(nouls={LANGUAGE_QUESTION: 0.01})
+        settings = StyleSettings()
+        tag_settings = TagSettings()
+
+        result = prompt_style(clip, classifier, prompt, settings=settings, tag_settings=tag_settings, style_cache={})
+        assert result.text == "an oil painting of a red barn"
+        assert result.listed == ("oil painting",)
+        assert [text for text, _kwargs in clip.tokenize_calls] == [
+            chat(tag_settings.translate_instruction.replace("{PROMPT}", prompt)),
+            chat(settings.prompt_instruction.replace("{PROMPT}", "an oil painting of a red barn")),
+        ]
+
+    @pytest.mark.parametrize(("streak", "reply"), [
+        (2, "oil painting, sunset, watercolor"),
+        (1, "oil painting, sunset"),
+    ], ids=["default-streak", "streak-of-one"])
+    def test_a_streak_of_ungrounded_phrases_ends_the_list(self, streak, reply):
+        clip = DecodingClip(words_of("oil painting, sunset, watercolor, red barn"))
+        classifier = StylingClassifier(nouls={LANGUAGE_QUESTION: 0.99})
+
+        result = prompt_style(clip, classifier, "an oil painting of a red barn",
+                              settings=StyleSettings(ungrounded_streak=streak), tag_settings=TagSettings(),
+                              style_cache={})
+        assert result.reply == reply
+        assert result.listed == ("oil painting",)
+
+    def test_reads_every_value_from_the_settings(self):
+        clip = ReplyingClip("oil painting, red barn")
+        classifier = StylingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_style={"oil painting": 0.95, "red barn": 0.9})
+        settings = StyleSettings(prompt_instruction="Name the medium of {PROMPT}.", prompt_max_tokens=32,
+                                 style_question='Is "{TAG}" a medium', style_threshold=0.95)
+
+        result = prompt_style(clip, classifier, "an oil painting of a red barn", settings=settings,
+                              tag_settings=TagSettings(), style_cache={})
+        (request, _image), = classifier.classify_calls
+        assert result.style == ("oil painting",)
+        assert clip.tokenize_calls[0][0] == chat("Name the medium of an oil painting of a red barn.")
+        assert clip.generate_calls[0][1]["max_length"] == 32
+        assert [question.instructions for question in request.questions.values()] == [
+            'Is "oil painting" a medium', 'Is "red barn" a medium']
+
+    def test_the_style_cache_stops_a_second_request_for_a_known_phrase(self):
+        clip = ReplyingClip("oil painting", "oil painting")
+        classifier = StylingClassifier(nouls={LANGUAGE_QUESTION: 0.99}, p_style={"oil painting": 0.9})
+        style_cache = {}
+
+        first = prompt_style(clip, classifier, "an oil painting", settings=StyleSettings(),
+                             tag_settings=TagSettings(), style_cache=style_cache)
+        second = prompt_style(clip, classifier, "an oil painting", settings=StyleSettings(),
+                              tag_settings=TagSettings(), style_cache=style_cache)
+        assert first == second
+        assert first.style == ("oil painting",)
+        assert len(classifier.classify_calls) == 1
+        assert style_cache == {"oil painting": 0.9}
+
+
+class StripImage:
+    """A [B, H, W, C] image, down to its shape and the strip slice locate_tags takes, which returns the strip's box."""
+
+    def __init__(self, height, width, batch=1):
+        self.shape = (batch, height, width, 3)
+
+    def __getitem__(self, key):
+        _batch, rows, columns, _channels = key
+        return StripBox(columns.start, rows.start, columns.stop, rows.stop)
+
+
+class StripClassifier:
+    """Classifier, down to nouls, with each statement's six strip scores scripted in strip_boxes order."""
+
+    def __init__(self, image, strips_of):
+        self.boxes = strip_boxes(image.shape[1], image.shape[2])
+        self.strips_of = {f"This image visibly contains {tag}": strips for tag, strips in strips_of.items()}
+        self.noul_calls = []
+
+    def nouls(self, statements, *, image=None, state=""):
+        strip = self.boxes.index(image)
+
+        self.noul_calls.append((list(statements), image))
+        return [self.strips_of.get(statement, (0.0,) * 6)[strip] for statement in statements]
+
+
+class TestStripBoxes:
+    def test_rows_then_columns_in_thirds(self):
+        assert strip_boxes(9, 6) == (StripBox(0, 0, 6, 3), StripBox(0, 3, 6, 6), StripBox(0, 6, 6, 9),
+                                     StripBox(0, 0, 2, 9), StripBox(2, 0, 4, 9), StripBox(4, 0, 6, 9))
+
+
+class TestAxisWord:
+    @pytest.mark.parametrize(("probabilities", "word"), [
+        ((0.2, 0.2, 0.2), None),
+        ((0.95, 0.2, 0.2), "top"),
+        ((0.2, 0.9, 0.2), "center"),
+        ((0.95, 0.95, 0.2), None),
+    ], ids=["no-strip", "one-strip", "one-strip-at-the-threshold", "two-strips"])
+    def test_names_only_a_single_present_strip(self, probabilities, word):
+        assert comfyui_locate.axis_word(probabilities, comfyui_locate.ROW_WORDS, 0.9) == word
+
+
+class TestPositionTerm:
+    @pytest.mark.parametrize(("row", "column", "term"), [
+        ("top", "left", "top-left"),
+        ("bottom", "right", "bottom-right"),
+        ("top", "center", "top"),
+        (None, "left", "left"),
+        ("center", None, "center"),
+        (None, None, ""),
+    ], ids=["row-and-column", "other-corner", "center-column", "no-row", "no-column", "neither"])
+    def test_joins_the_axis_words(self, row, column, term):
+        assert comfyui_locate.position_term(row, column) == term
+
+
+class TestLocateTags:
+    @pytest.fixture
+    def resamples(self, monkeypatch):
+        """The locate module's resample_image, recording each strip and pixel count and returning the strip."""
+        calls = []
+
+        def resample(strip, pixels):
+            calls.append((strip, pixels))
+            return strip
+
+        monkeypatch.setattr(comfyui_locate, "resample_image", resample)
+        return calls
+
+    def test_the_defaults_are_the_ported_values(self):
+        assert STRIP_PIXELS == 250_000
+        assert POSITION_THRESHOLD == 0.9
+
+    def test_names_each_place_and_drops_a_tag_no_strip_holds(self, resamples):
+        image = StripImage(9, 6)
+        cat = (0.95, 0.2, 0.2, 0.95, 0.2, 0.2)
+        tree = (0.95, 0.95, 0.2, 0.2, 0.95, 0.2)
+        moon = (0.2,) * 6
+        classifier = StripClassifier(image, {"cat": cat, "tree": tree, "moon": moon})
+
+        result = locate_tags(classifier, image, ["cat", "tree", "moon"])
+        assert result == TagPlaces(strips=(cat, tree, moon), terms=("top-left", "center", ""), unplaced=("moon",),
+                                   placed=(("cat", "top-left"), ("tree", "center")))
+        assert resamples == [(box, STRIP_PIXELS) for box in strip_boxes(9, 6)]
+        assert [statements for statements, _strip in classifier.noul_calls] == [[
+            "This image visibly contains cat", "This image visibly contains tree", "This image visibly contains moon",
+        ]] * 6
+
+    @pytest.mark.parametrize("count", [1, 5])
+    def test_makes_six_requests_for_any_number_of_tags(self, resamples, count):
+        image = StripImage(9, 6)
+        classifier = StripClassifier(image, {})
+
+        locate_tags(classifier, image, [f"tag {index}" for index in range(count)])
+        assert [strip for _statements, strip in classifier.noul_calls] == list(strip_boxes(9, 6))
+
+    def test_reads_the_statement_threshold_and_pixels(self, resamples):
+        image = StripImage(9, 6)
+        classifier = StripClassifier(image, {})
+        classifier.strips_of = {"A photo of a cat": (0.6, 0.2, 0.2, 0.2, 0.2, 0.6)}
+
+        result = locate_tags(classifier, image, ["a cat"], statement="A photo of {TAG}", threshold=0.5, pixels=1_000)
+        assert result.placed == (("a cat", "top-right"),)
+        assert {pixels for _strip, pixels in resamples} == {1_000}
+
+    def test_no_tags_make_no_request(self, resamples):
+        image = StripImage(9, 6)
+        classifier = StripClassifier(image, {})
+
+        assert locate_tags(classifier, image, []) == TagPlaces(strips=(), terms=(), unplaced=(), placed=())
+        assert classifier.noul_calls == []
+        assert resamples == []
+
+    def test_a_batch_of_two_raises(self, resamples):
+        image = StripImage(9, 6, batch=2)
+        classifier = StripClassifier(StripImage(9, 6), {})
+
+        with pytest.raises(ValueError, match=r"^locate_tags got a batch of 2 images"):
+            locate_tags(classifier, image, ["cat"])
+        assert classifier.noul_calls == []
+
+    @pytest.mark.parametrize(("height", "width"), [(2, 6), (9, 2)], ids=["short", "narrow"])
+    def test_a_side_below_three_pixels_raises(self, resamples, height, width):
+        classifier = StripClassifier(StripImage(9, 6), {})
+
+        with pytest.raises(ValueError, match=rf"^locate_tags got an image of height {height} and width {width}\."):
+            locate_tags(classifier, StripImage(height, width), ["cat"])
+        assert classifier.noul_calls == []
+
+    @pytest.mark.parametrize("threshold", [-0.1, 1.5, float("nan")], ids=["below-0", "above-1", "nan"])
+    def test_a_threshold_outside_0_to_1_raises(self, resamples, threshold):
+        image = StripImage(9, 6)
+        classifier = StripClassifier(image, {})
+
+        with pytest.raises(ValueError, match=rf"^locate_tags got threshold={threshold!r}\. Use a value from 0 to 1"):
+            locate_tags(classifier, image, ["cat"], threshold=threshold)
+        assert classifier.noul_calls == []
+
+
+class TestRenderPlaced:
+    def test_joins_each_tag_with_its_term(self):
+        assert render_placed([("cat", "top-left"), ("sky", ""), ("tree", "center")]) == "cat top-left, sky, tree center"
+
+    def test_no_pairs_render_an_empty_text(self):
+        assert render_placed([]) == ""
